@@ -4,6 +4,7 @@
  * See LICENSE file in the root directory for full license text.
 */
 #include "./src/bbsl.hpp"
+#include "./src/bbrb.hpp"
 #include <cmath>
 #include <iostream>
 #include <vector>
@@ -13,6 +14,20 @@
 #include <random>
 #include <algorithm>
 #include <unordered_map>
+#include <memory>
+#include <cstdlib>
+#include <fstream>
+
+#if defined(_WIN32)
+    #define NOMINMAX
+    #include <windows.h>
+    #include <psapi.h>
+    #include <malloc.h>
+#elif defined(__APPLE__)
+    #include <mach/mach.h>
+#elif defined(__linux__)
+    #include <malloc.h>
+#endif
 
 constexpr auto testCount = 1'000'000;
 using namespace bbsl;
@@ -45,6 +60,16 @@ public:
         return std::distance(probabilities.begin(), it);
     }
 };
+
+// pre-generate Zipf indices so the generator cost stays outside the timed region
+std::vector<uint64_t> generateZipfIndices(ZipfGenerator& zipf, uint64_t count) {
+    std::vector<uint64_t> indices;
+    indices.reserve(static_cast<size_t>(count));
+    for (uint64_t i = 0; i < count; ++i) {
+        indices.push_back(zipf.next());
+    }
+    return indices;
+}
 
 void test1() {
     BitmappedBlockSkipList<uint64_t, double> skiplist(std::nan(""));
@@ -351,23 +376,24 @@ void test_performance_zipf_stdmap(uint64_t seed) {
         m[i] = static_cast<int>(i);
     }
 
-    // Zipf distribution query
+    // Zipf distribution query (indices pre-generated outside the timed region)
+    std::vector<uint64_t> indices = generateZipfIndices(zipf, N);
     auto start_query = std::chrono::high_resolution_clock::now();
     int sum = 0;
     for (uint64_t i = 0; i < N; ++i) {
-        uint64_t idx = zipf.next();
-        sum += m[idx];
+        sum += m[indices[i]];
     }
     auto end_query = std::chrono::high_resolution_clock::now();
     std::cout << "[std::map] Zipf Query (α=0.8) " << N << " : "
         << (end_query - start_query).count() / 1e9 << "s\n";
     std::cout << "[std::map] Sum: " << sum << std::endl;
 
-    // Zipf distribution mixed operations (80% query, 20% update)
+    // Zipf distribution mixed operations (80% query, 20% update), indices pre-generated
     ZipfGenerator zipf2(seed + 1, N, 0.8);
+    std::vector<uint64_t> indices2 = generateZipfIndices(zipf2, N);
     auto start_mixed = std::chrono::high_resolution_clock::now();
     for (uint64_t i = 0; i < N; ++i) {
-        uint64_t idx = zipf2.next();
+        uint64_t idx = indices2[i];
         if (i % 5 == 0) {  // 20% write
             m[idx] = static_cast<int>(i);
         }
@@ -390,12 +416,12 @@ void test_performance_zipf_bsl(uint64_t seed) {
         skiplist[i] = static_cast<int>(i);
     }
 
-    // Zipf distribution query
+    // Zipf distribution query (indices pre-generated outside the timed region)
+    std::vector<uint64_t> indices = generateZipfIndices(zipf, N);
     auto start_query = std::chrono::high_resolution_clock::now();
     int sum = 0;
     for (uint64_t i = 0; i < N; ++i) {
-        uint64_t idx = zipf.next();
-        sum += skiplist[idx];
+        sum += skiplist[indices[i]];
     }
     auto end_query = std::chrono::high_resolution_clock::now();
     std::cout << "[bsl] Zipf Query (α=0.8) " << N << " : "
@@ -403,11 +429,12 @@ void test_performance_zipf_bsl(uint64_t seed) {
     std::cout << "[bsl] Sum: " << sum << std::endl;
     std::cout << "[bsl] level " << skiplist.getLevel() << std::endl;
 
-    // Zipf distribution mixed operations (80% query, 20% update)
+    // Zipf distribution mixed operations (80% query, 20% update), indices pre-generated
     ZipfGenerator zipf2(seed + 1, N, 0.8);
+    std::vector<uint64_t> indices2 = generateZipfIndices(zipf2, N);
     auto start_mixed = std::chrono::high_resolution_clock::now();
     for (uint64_t i = 0; i < N; ++i) {
-        uint64_t idx = zipf2.next();
+        uint64_t idx = indices2[i];
         if (i % 5 == 0) {  // 20% write
             skiplist[idx] = static_cast<int>(i);
         }
@@ -468,6 +495,30 @@ void test_performance_range_bsl() {
     std::cout << "[bsl] Range queries (500 elements x 1000) : "
         << (end_range - start_range).count() / 1e9 << "s\n";
     std::cout << "[bsl] Range sum: " << sum << std::endl;
+}
+
+void test_performance_range_scan_bsl() {
+    const uint64_t N = testCount;
+    BitmappedBlockSkipList<uint64_t, int> skiplist(-1);
+
+    for (uint64_t i = 0; i < N; ++i) {
+        skiplist[i] = static_cast<int>(i);
+    }
+
+    // one lowerBound per window, then walk the level-0 chain - the real range-scan pattern
+    auto start_range = std::chrono::high_resolution_clock::now();
+    long long sum = 0;
+    for (uint64_t i = 0; i < 1000; ++i) {
+        uint64_t start = i * 1000;
+        uint64_t end = start + 500;
+        for (auto it = skiplist.lowerBound(start); it != skiplist.end() && it.key() < end; ++it) {
+            sum += *it;
+        }
+    }
+    auto end_range = std::chrono::high_resolution_clock::now();
+    std::cout << "[bsl] Range scans (500 elements x 1000) : "
+        << (end_range - start_range).count() / 1e9 << "s\n";
+    std::cout << "[bsl] Range scan sum: " << sum << std::endl;
 }
 
 // ============= New: Batch Operation Performance Tests =============
@@ -778,8 +829,528 @@ void test_hashmap_traversal_performance() {
     assert(sum1 == sum2 && sum2 == sum3);
 }
 
+// ============= BBRB correctness smoke test =============
+
+void test_bbrb_correctness() {
+    bbrb::BitmappedBlockRBMap<uint64_t, int> map(-999);
+
+    // basic write/read
+    for (uint64_t i = 0; i < 10; ++i) map[i] = static_cast<int>(i * 2);
+    for (uint64_t i = 0; i < 10; ++i) {
+        assert(map.has(i));
+        assert(map[i] == static_cast<int>(i * 2));
+    }
+
+    // find not exist
+    assert(!map.has(100));
+    int notfound = map[100];
+    assert(notfound == -999);
+
+    // test delete and reinsertion
+    assert(map.erase(5));
+    assert(!map.has(5));
+    int deleted = map[5];
+    assert(deleted == -999);
+    map[5] = 42;
+    assert(map.has(5));
+    assert(map[5] == 42);
+
+    // block boundary
+    map[31] = 99;
+    assert(map.has(31));
+    assert(map[31] == 99);
+
+    // large index edge
+    map[UINT64_MAX] = 7;
+    assert(map.has(UINT64_MAX));
+    assert(map[UINT64_MAX] == 7);
+    assert(!map.has(UINT64_MAX - 1));
+
+    // sparsity
+    for (uint64_t i = 0; i < 1000; i += 100) map[i] = static_cast<int>(i);
+    for (uint64_t i = 0; i < 1000; ++i) {
+        if (i % 100 == 0) assert(map.has(i));
+        else assert(!map.has(i));
+    }
+
+    // erase everything back
+    for (uint64_t i = 0; i < 10; ++i) assert(map.erase(i));
+    for (uint64_t i = 0; i < 10; ++i) assert(!map.has(i));
+
+    // traversal consistency
+    bbrb::BitmappedBlockRBMap<uint64_t, int> m2(-1);
+    for (uint64_t i = 0; i < 100; ++i) m2[i] = static_cast<int>(i);
+    long long sum = 0;
+    m2.forEach([&sum](int v, uint64_t) { sum += v; });
+    assert(sum == 4950);
+    sum = 0;
+    for (auto it = m2.begin(); it != m2.end(); ++it) sum += *it;
+    assert(sum == 4950);
+    sum = 0;
+    for (auto it = m2.rbegin(); it != m2.rend(); --it) sum += *it;
+    assert(sum == 4950);
+
+    std::cout << "test_bbrb_correctness passed!" << std::endl;
+}
+
+// ============= BBRB performance tests (mirrors of the BSL ones) =============
+
+void test_performance_bbrb(uint64_t seed) {
+    const uint64_t N = testCount;
+    bbrb::BitmappedBlockRBMap<uint64_t, int> map(-1);
+
+    auto start_insert = std::chrono::high_resolution_clock::now();
+    for (uint64_t i = 0; i < N; ++i) {
+        map[i] = static_cast<int>(i);
+    }
+    auto end_insert = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> insert_duration = end_insert - start_insert;
+    std::cout << "[bbrb] Insert " << N << " elements took: " << insert_duration.count() << " seconds" << std::endl;
+
+    auto start_query = std::chrono::high_resolution_clock::now();
+    int sum = 0;
+    for (uint64_t i = 0; i < N; ++i) {
+        int value = map[i];
+        sum += value;
+    }
+    auto end_query = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> query_duration = end_query - start_query;
+    std::cout << "[bbrb] Query " << N << " elements took: " << query_duration.count() << " seconds" << std::endl;
+    std::cout << "[bbrb] Query sum: " << sum << std::endl;
+    std::cout << "[bbrb] blocks " << map.blockCount() << std::endl;
+
+    auto start_random_query = std::chrono::high_resolution_clock::now();
+    int random_sum = 0;
+    const uint64_t a = 6364136223846793005ULL;
+    const uint64_t c = 1;
+    uint64_t seed_tmp = seed;
+    for (uint64_t i = 0; i < N; ++i) {
+        seed_tmp = seed_tmp * a + c;
+        uint64_t idx = seed_tmp % N;
+        int value = map[idx];
+        random_sum += value;
+    }
+    auto end_random_query = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> random_query_duration = end_random_query - start_random_query;
+    std::cout << "[bbrb] Random query " << N << " times took: " << random_query_duration.count() << " seconds" << std::endl;
+    std::cout << "[bbrb] Random query sum: " << random_sum << std::endl;
+}
+
+void test_performance_random_bbrb(uint64_t seedA, uint64_t seedB) {
+    const uint64_t N = testCount;
+    const uint64_t deleteCount = static_cast<uint64_t>(N * 0.2);
+    bbrb::BitmappedBlockRBMap<uint64_t, int> map(-1);
+
+    auto start_insert = std::chrono::high_resolution_clock::now();
+    for (uint64_t i = 0; i < N; ++i) map[i] = static_cast<int>(i);
+    auto end_insert = std::chrono::high_resolution_clock::now();
+    std::cout << "[bbrb] Insert " << N << " : " << (end_insert - start_insert).count() / 1e9 << "s\n";
+
+    uint64_t seed = seedA, a = 6364136223846793005ULL, c = 1;
+    auto start_delete = std::chrono::high_resolution_clock::now();
+    for (uint64_t i = 0; i < deleteCount; ++i) {
+        seed = seed * a + c;
+        map.erase(seed);
+    }
+    auto end_delete = std::chrono::high_resolution_clock::now();
+    std::cout << "[bbrb] Delete " << deleteCount << " : " << (end_delete - start_delete).count() / 1e9 << "s\n";
+
+    seed = seedB;
+    auto start_write_delete = std::chrono::high_resolution_clock::now();
+    for (uint64_t i = 0; i < N; ++i) {
+        seed = seed * a + c;
+        uint64_t idx = seed % N;
+        if (i % 2 == 0) map[idx] = static_cast<int>(i);
+        else map.erase(idx);
+    }
+    auto end_write_delete = std::chrono::high_resolution_clock::now();
+    std::cout << "[bbrb] Write/Delete " << N << " : " << (end_write_delete - start_write_delete).count() / 1e9 << "s\n";
+}
+
+void test_performance_sequential_bbrb(uint64_t seed) {
+    const uint64_t N = testCount;
+    bbrb::BitmappedBlockRBMap<uint64_t, int> map(-1);
+
+    auto start_insert = std::chrono::high_resolution_clock::now();
+    for (uint64_t i = 0; i < N; ++i) {
+        map[i] = static_cast<int>(i);
+    }
+    auto end_insert = std::chrono::high_resolution_clock::now();
+    std::cout << "[bbrb] Sequential Insert " << N << " : "
+        << (end_insert - start_insert).count() / 1e9 << "s\n";
+
+    auto start_query = std::chrono::high_resolution_clock::now();
+    int sum = 0;
+    for (uint64_t i = 0; i < N; ++i) {
+        sum += map[i];
+    }
+    auto end_query = std::chrono::high_resolution_clock::now();
+    std::cout << "[bbrb] Sequential Query " << N << " : "
+        << (end_query - start_query).count() / 1e9 << "s\n";
+    std::cout << "[bbrb] Sum: " << sum << std::endl;
+    std::cout << "[bbrb] blocks " << map.blockCount() << std::endl;
+}
+
+void test_performance_zipf_bbrb(uint64_t seed) {
+    const uint64_t N = testCount;
+    bbrb::BitmappedBlockRBMap<uint64_t, int> map(-1);
+    ZipfGenerator zipf(seed, N, 0.8);
+
+    // Pre-insert all data
+    for (uint64_t i = 0; i < N; ++i) {
+        map[i] = static_cast<int>(i);
+    }
+
+    // Zipf distribution query (indices pre-generated outside the timed region)
+    std::vector<uint64_t> indices = generateZipfIndices(zipf, N);
+    auto start_query = std::chrono::high_resolution_clock::now();
+    int sum = 0;
+    for (uint64_t i = 0; i < N; ++i) {
+        sum += map[indices[i]];
+    }
+    auto end_query = std::chrono::high_resolution_clock::now();
+    std::cout << "[bbrb] Zipf Query (α=0.8) " << N << " : "
+        << (end_query - start_query).count() / 1e9 << "s\n";
+    std::cout << "[bbrb] Sum: " << sum << std::endl;
+    std::cout << "[bbrb] blocks " << map.blockCount() << std::endl;
+
+    // Zipf distribution mixed operations (80% query, 20% update), indices pre-generated
+    ZipfGenerator zipf2(seed + 1, N, 0.8);
+    std::vector<uint64_t> indices2 = generateZipfIndices(zipf2, N);
+    auto start_mixed = std::chrono::high_resolution_clock::now();
+    for (uint64_t i = 0; i < N; ++i) {
+        uint64_t idx = indices2[i];
+        if (i % 5 == 0) {  // 20% write
+            map[idx] = static_cast<int>(i);
+        }
+        else {  // 80% query
+            sum += map[idx];
+        }
+    }
+    auto end_mixed = std::chrono::high_resolution_clock::now();
+    std::cout << "[bbrb] Zipf Mixed (80/20) " << N << " : "
+        << (end_mixed - start_mixed).count() / 1e9 << "s\n";
+}
+
+void test_performance_range_bbrb() {
+    const uint64_t N = testCount;
+    bbrb::BitmappedBlockRBMap<uint64_t, int> map(-1);
+
+    for (uint64_t i = 0; i < N; ++i) {
+        map[i] = static_cast<int>(i);
+    }
+
+    auto start_range = std::chrono::high_resolution_clock::now();
+    int sum = 0;
+    for (uint64_t i = 0; i < 1000; ++i) {
+        uint64_t start = i * 1000;
+        uint64_t end = start + 500;
+        for (uint64_t j = start; j < end; ++j) {
+            sum += map[j];
+        }
+    }
+    auto end_range = std::chrono::high_resolution_clock::now();
+    std::cout << "[bbrb] Range queries (500 elements x 1000) : "
+        << (end_range - start_range).count() / 1e9 << "s\n";
+    std::cout << "[bbrb] Range sum: " << sum << std::endl;
+}
+
+void test_performance_range_scan_bbrb() {
+    const uint64_t N = testCount;
+    bbrb::BitmappedBlockRBMap<uint64_t, int> map(-1);
+
+    for (uint64_t i = 0; i < N; ++i) {
+        map[i] = static_cast<int>(i);
+    }
+
+    // one lowerBound per window, then walk the chain - the real range-scan pattern
+    auto start_range = std::chrono::high_resolution_clock::now();
+    long long sum = 0;
+    for (uint64_t i = 0; i < 1000; ++i) {
+        uint64_t start = i * 1000;
+        uint64_t end = start + 500;
+        for (auto it = map.lowerBound(start); it != map.end() && it.key() < end; ++it) {
+            sum += *it;
+        }
+    }
+    auto end_range = std::chrono::high_resolution_clock::now();
+    std::cout << "[bbrb] Range scans (500 elements x 1000) : "
+        << (end_range - start_range).count() / 1e9 << "s\n";
+    std::cout << "[bbrb] Range scan sum: " << sum << std::endl;
+}
+
+void test_performance_batch_bbrb() {
+    const uint64_t N = testCount;
+    bbrb::BitmappedBlockRBMap<uint64_t, int> map(-1);
+
+    auto start_batch = std::chrono::high_resolution_clock::now();
+    for (uint64_t i = 0; i < N; i += 1000) {
+        for (uint64_t j = 0; j < 1000; ++j) {
+            map[i + j] = static_cast<int>(i + j);
+        }
+    }
+    auto end_batch = std::chrono::high_resolution_clock::now();
+    std::cout << "[bbrb] Batch insert (1000/batch) : "
+        << (end_batch - start_batch).count() / 1e9 << "s\n";
+}
+
+void test_traversal_performance_bbrb() {
+    const uint64_t N = testCount;
+    bbrb::BitmappedBlockRBMap<uint64_t, int> map(-1);
+
+    // Insert dense data
+    for (uint64_t i = 0; i < N; ++i) {
+        map[i] = static_cast<int>(i);
+    }
+    std::cout << "\n========== BBRB Traversal Performance Tests ==========\n";
+    std::cout << "Data: " << N << " dense elements\n";
+
+    // Test 1: forEach
+    auto start = std::chrono::high_resolution_clock::now();
+    long long sum1 = 0;
+    map.forEach([&sum1](int value, uint64_t) {
+        sum1 += value;
+        });
+    auto end = std::chrono::high_resolution_clock::now();
+    double time_forEach = (end - start).count() / 1e9;
+    std::cout << "[bbrb] forEach: " << time_forEach << "s, sum=" << sum1 << std::endl;
+
+    // Test 2: Iterator (begin/end)
+    start = std::chrono::high_resolution_clock::now();
+    long long sum2 = 0;
+    for (auto it = map.begin(); it != map.end(); ++it) {
+        sum2 += *it;
+    }
+    end = std::chrono::high_resolution_clock::now();
+    double time_iterator = (end - start).count() / 1e9;
+    std::cout << "[bbrb] Iterator: " << time_iterator << "s, sum=" << sum2 << std::endl;
+
+    // Test 3: Reverse iterator (rbegin/rend)
+    start = std::chrono::high_resolution_clock::now();
+    long long sum3 = 0;
+    for (auto it = map.rbegin(); it != map.rend(); --it) {
+        sum3 += *it;
+    }
+    end = std::chrono::high_resolution_clock::now();
+    double time_reverse = (end - start).count() / 1e9;
+    std::cout << "[bbrb] Reverse Iterator: " << time_reverse << "s, sum=" << sum3 << std::endl;
+
+    // Test 4: Random access (operator[])
+    start = std::chrono::high_resolution_clock::now();
+    long long sum4 = 0;
+    for (uint64_t i = 0; i < N; ++i) {
+        sum4 += map[i];
+    }
+    end = std::chrono::high_resolution_clock::now();
+    double time_random = (end - start).count() / 1e9;
+    std::cout << "[bbrb] Random Access: " << time_random << "s, sum=" << sum4 << std::endl;
+
+    // Summary
+    std::cout << "\n--- BBRB Performance Summary (forEach as baseline) ---\n";
+    std::cout << "forEach:       " << time_forEach << "s (1.00x)\n";
+    std::cout << "Iterator:      " << time_iterator << "s (" << (time_iterator / time_forEach) << "x)\n";
+    std::cout << "Reverse Iter:  " << time_reverse << "s (" << (time_reverse / time_forEach) << "x)\n";
+    std::cout << "Random Access: " << time_random << "s (" << (time_random / time_forEach) << "x)\n";
+
+    // Verify all sums match
+    assert(sum1 == sum2 && sum2 == sum3 && sum3 == sum4);
+}
+
+void test_sparse_traversal_performance_bbrb() {
+    const uint64_t N = testCount;
+    bbrb::BitmappedBlockRBMap<uint64_t, int> map(-1);
+
+    // Insert sparse data (10% density)
+    for (uint64_t i = 0; i < N; i += 10) {
+        map[i] = static_cast<int>(i);
+    }
+    uint64_t element_count = N / 10;
+    std::cout << "\n========== BBRB Sparse Traversal Performance Tests ==========\n";
+    std::cout << "Data: " << element_count << " sparse elements (10% density)\n";
+
+    // Test 1: forEach
+    auto start = std::chrono::high_resolution_clock::now();
+    long long sum1 = 0;
+    map.forEach([&sum1](int value, uint64_t) {
+        sum1 += value;
+        });
+    auto end = std::chrono::high_resolution_clock::now();
+    double time_forEach = (end - start).count() / 1e9;
+    std::cout << "[bbrb] forEach: " << time_forEach << "s, sum=" << sum1 << std::endl;
+
+    // Test 2: Iterator
+    start = std::chrono::high_resolution_clock::now();
+    long long sum2 = 0;
+    for (auto it = map.begin(); it != map.end(); ++it) {
+        sum2 += *it;
+    }
+    end = std::chrono::high_resolution_clock::now();
+    double time_iterator = (end - start).count() / 1e9;
+    std::cout << "[bbrb] Iterator: " << time_iterator << "s, sum=" << sum2 << std::endl;
+
+    // Test 3: Random access (only existing keys)
+    start = std::chrono::high_resolution_clock::now();
+    long long sum3 = 0;
+    for (uint64_t i = 0; i < N; i += 10) {
+        sum3 += map[i];
+    }
+    end = std::chrono::high_resolution_clock::now();
+    double time_random = (end - start).count() / 1e9;
+    std::cout << "[bbrb] Random Access (existing): " << time_random << "s, sum=" << sum3 << std::endl;
+
+    std::cout << "\n--- BBRB Sparse Performance Summary ---\n";
+    std::cout << "forEach:  " << time_forEach << "s\n";
+    std::cout << "Iterator: " << time_iterator << "s (" << (time_iterator / time_forEach) << "x)\n";
+    std::cout << "Random:   " << time_random << "s (" << (time_random / time_forEach) << "x)\n";
+
+    assert(sum1 == sum2 && sum2 == sum3);
+}
+
+// ============= Memory Footprint Tests =============
+
+// commit/resident charge of the whole process, includes every heap node of a live container
+size_t getCommit() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc{};
+    GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
+    return static_cast<size_t>(pmc.PagefileUsage);
+#elif defined(__APPLE__)
+    mach_task_basic_info_data_t info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS) {
+        return static_cast<size_t>(info.resident_size);
+    }
+    return 0;
+#elif defined(__linux__)
+    // resident set size, the pragmatic analog of commit charge for a fully write-touched container
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind("VmRSS:", 0) == 0) {
+            return static_cast<size_t>(std::strtol(line.c_str() + 6, nullptr, 10)) * 1024;
+        }
+    }
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+// release freed-but-retained heap blocks, otherwise the next pass reuses them and the
+// measurement delta under-reports the container size (fatally for small containers)
+void shrinkHeap() {
+#if defined(_WIN32)
+    _heapmin();
+    HeapCompact(GetProcessHeap(), 0);
+#elif defined(__GLIBC__)
+    malloc_trim(0);
+#else
+    // no portable heap compaction on this platform, the two-pass measurement still absorbs most of the bias
+#endif
+}
+
+// measures the commit delta while the container is alive; two passes, the second one is reported
+// so first-touch / heap-segment growth noise lands in pass 1
+template<typename T, typename Make, typename Fill>
+void measureMemory(const char* name, uint64_t elementCount, Make&& make, Fill&& fill) {
+    // pass 1: warm the heap
+    {
+        std::unique_ptr<T> c = make();
+        fill(*c);
+    }
+
+    shrinkHeap();
+    const size_t base = getCommit();
+    size_t live = 0;
+    {
+        std::unique_ptr<T> c = make();
+        fill(*c);
+        live = getCommit() - base;
+    }
+    shrinkHeap();
+    const size_t after = getCommit();
+    const size_t lingering = after > base ? after - base : 0;
+
+    const double mb = static_cast<double>(live) / (1024.0 * 1024.0);
+    const double bpe = elementCount ? static_cast<double>(live) / static_cast<double>(elementCount) : 0.0;
+    std::cout << "  [" << name << "] " << mb << " MB, " << bpe << " B/elem"
+        << " (lingering after free: " << lingering << " bytes)" << std::endl;
+}
+
+void test_memory_footprint() {
+    const uint64_t N = testCount;
+
+    std::cout << "\n========== Memory Footprint Tests ==========\n";
+
+    // fixed per-instance cost, no heap internals exist while empty
+    std::cout << "\n[Empty instance sizeof] (fixed cost per instance)\n";
+    std::cout << "  std::vector<int>       : " << sizeof(std::vector<int>) << " bytes\n";
+    std::cout << "  std::map<u64,i>        : " << sizeof(std::map<uint64_t, int>) << " bytes\n";
+    std::cout << "  std::unordered_map     : " << sizeof(std::unordered_map<uint64_t, int>) << " bytes\n";
+    std::cout << "  bbsl skip list         : " << sizeof(BitmappedBlockSkipList<uint64_t, int>) << " bytes\n";
+    std::cout << "  bbrb rb map            : " << sizeof(bbrb::BitmappedBlockRBMap<uint64_t, int>) << " bytes\n";
+
+    // ---- dense ----
+    std::cout << "\n[Dense: " << N << " elements in [0," << N << ")]\n";
+    measureMemory<std::vector<int>>("vector", N,
+        [] { return std::make_unique<std::vector<int>>(); },
+        [](std::vector<int>& v) {
+            v.reserve(testCount);
+            for (uint64_t i = 0; i < testCount; ++i) v.push_back(static_cast<int>(i));
+        });
+    measureMemory<std::map<uint64_t, int>>("std::map", N,
+        [] { return std::make_unique<std::map<uint64_t, int>>(); },
+        [](std::map<uint64_t, int>& m) {
+            for (uint64_t i = 0; i < testCount; ++i) m[i] = static_cast<int>(i);
+        });
+    measureMemory<std::unordered_map<uint64_t, int>>("unordered_map", N,
+        [] { return std::make_unique<std::unordered_map<uint64_t, int>>(); },
+        [](std::unordered_map<uint64_t, int>& m) {
+            for (uint64_t i = 0; i < testCount; ++i) m[i] = static_cast<int>(i);
+        });
+    measureMemory<BitmappedBlockSkipList<uint64_t, int>>("bbsl", N,
+        [] { return std::make_unique<BitmappedBlockSkipList<uint64_t, int>>(-1); },
+        [](BitmappedBlockSkipList<uint64_t, int>& c) {
+            for (uint64_t i = 0; i < testCount; ++i) c[i] = static_cast<int>(i);
+        });
+    measureMemory<bbrb::BitmappedBlockRBMap<uint64_t, int>>("bbrb", N,
+        [] { return std::make_unique<bbrb::BitmappedBlockRBMap<uint64_t, int>>(-1); },
+        [](bbrb::BitmappedBlockRBMap<uint64_t, int>& c) {
+            for (uint64_t i = 0; i < testCount; ++i) c[i] = static_cast<int>(i);
+        });
+
+    // ---- sparse family: elementCount keys, stride `step`, so blocks get thinner as step grows ----
+    auto sparseCase = [&](const char* title, uint64_t elementCount, uint64_t step) {
+        std::cout << "\n[" << title << ": " << elementCount << " elements, key stride " << step << "]\n";
+        measureMemory<std::map<uint64_t, int>>("std::map", elementCount,
+            [] { return std::make_unique<std::map<uint64_t, int>>(); },
+            [&](std::map<uint64_t, int>& m) {
+                for (uint64_t i = 0; i < elementCount; ++i) m[i * step] = static_cast<int>(i);
+            });
+        measureMemory<std::unordered_map<uint64_t, int>>("unordered_map", elementCount,
+            [] { return std::make_unique<std::unordered_map<uint64_t, int>>(); },
+            [&](std::unordered_map<uint64_t, int>& m) {
+                for (uint64_t i = 0; i < elementCount; ++i) m[i * step] = static_cast<int>(i);
+            });
+        measureMemory<BitmappedBlockSkipList<uint64_t, int>>("bbsl", elementCount,
+            [] { return std::make_unique<BitmappedBlockSkipList<uint64_t, int>>(-1); },
+            [&](BitmappedBlockSkipList<uint64_t, int>& c) {
+                for (uint64_t i = 0; i < elementCount; ++i) c[i * step] = static_cast<int>(i);
+            });
+        measureMemory<bbrb::BitmappedBlockRBMap<uint64_t, int>>("bbrb", elementCount,
+            [] { return std::make_unique<bbrb::BitmappedBlockRBMap<uint64_t, int>>(-1); },
+            [&](bbrb::BitmappedBlockRBMap<uint64_t, int>& c) {
+                for (uint64_t i = 0; i < elementCount; ++i) c[i * step] = static_cast<int>(i);
+            });
+    };
+
+    sparseCase("Sparse 10%", N / 10, 10);
+    sparseCase("Sparse 1%", N / 10, 1'000);
+    sparseCase("Scattered (worst case, ~1 element per block)", N / 10, 99'991);
+}
+
 int main() {
-    std::cout << "Starting data structure `BBSL` benchmark test" << std::endl;
+    std::cout << "Starting data structure `BBSL` + `BBRB` benchmark test" << std::endl;
 #ifndef NDEBUG
     std::cout << "Running in Debug mode" << std::endl;
 #else
@@ -791,6 +1362,7 @@ int main() {
     test2();
     test3();
     test4();
+    test_bbrb_correctness();
 
     // Generate random seeds using system time and other sources
     auto now = std::chrono::high_resolution_clock::now();
@@ -803,31 +1375,43 @@ int main() {
     std::cout << "\n========== Original Performance Tests (Random Access) ==========\n";
     test_performance_stdmap(seedA);
     test_performance_bsl(seedA);
+    test_performance_bbrb(seedA);
     test_performance_random_stdmap(seedA, seedB);
     test_performance_random_bsl(seedA, seedB);
+    test_performance_random_bbrb(seedA, seedB);
 
     std::cout << "\n========== New: Sequential Access Performance Tests ==========\n";
     test_performance_sequential_stdmap(seedA);
     test_performance_sequential_bsl(seedA);
+    test_performance_sequential_bbrb(seedA);
 
     std::cout << "\n========== New: Zipf Distribution (Realistic Scenario) ==========\n";
     test_performance_zipf_stdmap(seedA);
     test_performance_zipf_bsl(seedA);
+    test_performance_zipf_bbrb(seedA);
 
     std::cout << "\n========== New: Range Query Performance Tests ==========\n";
     test_performance_range_stdmap();
     test_performance_range_bsl();
+    test_performance_range_scan_bsl();
+    test_performance_range_bbrb();
+    test_performance_range_scan_bbrb();
 
     std::cout << "\n========== New: Batch Operation Performance Tests ==========\n";
     test_performance_batch_stdmap();
     test_performance_batch_bsl();
+    test_performance_batch_bbrb();
 
     std::cout << "\n========== New: traversal Performance Tests ==========\n";
     test_traversal_performance();
+    test_traversal_performance_bbrb();
     test_sparse_traversal_performance();
+    test_sparse_traversal_performance_bbrb();
     test_stdmap_traversal_performance();
     test_hashmap_traversal_performance();
     test_vector_traversal_performance();
+
+    test_memory_footprint();
 
     return 0;
 }

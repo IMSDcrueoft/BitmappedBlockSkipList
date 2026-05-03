@@ -8,27 +8,35 @@
 #include <cstddef>
 #include <cstdint>
 #include <algorithm>
+#include <limits>
 #include <iostream>
 #include <memory_resource>
 
 #include "./bits.hpp"
-#include "./slab.hpp"
 
 namespace bbsl {
-	template<typename T, typename = std::enable_if<std::is_trivial_v<T>&& std::is_standard_layout_v<T>>>
-	T* _realloc(T* pointer, size_t oldCount, size_t newSize) {
-		if (newSize == 0) {
+	/**
+	 * @brief	byte granularity realloc: nullptr in allocates, zero size out frees.
+	 *			every node allocation goes through here so the allocator can be swapped in one place.
+	 */
+	inline void* _reallocBytes(void* pointer, const size_t newBytes) {
+		if (newBytes == 0) {
 			if (pointer != nullptr) std::free(pointer);
 			return nullptr;
 		}
 
-		T* result = static_cast<T*>(std::realloc(pointer, sizeof(T) * newSize));
+		void* result = std::realloc(pointer, newBytes);
 		if (result == nullptr) {
 			std::cerr << "Memory reallocation failed!\n";
 			exit(1);
 		}
 
 		return result;
+	}
+
+	template<typename T, typename = std::enable_if<std::is_trivial_v<T>&& std::is_standard_layout_v<T>>>
+	T* _realloc(T* pointer, size_t oldCount, size_t newSize) {
+		return static_cast<T*>(_reallocBytes(pointer, sizeof(T) * newSize));
 	}
 
 	class Xoroshiro64StarStar {
@@ -66,7 +74,7 @@ namespace bbsl {
 	 *  and when deleted, they are deleted in place instead of splitting
 	 *  avoiding the complexity caused by merging and splitting
 	 */
-	template <typename index_t, typename value_t, typename = std::enable_if<std::is_integral_v<index_t>&& std::is_trivial_v<value_t>&& std::is_standard_layout_v<value_t>>>
+	template <typename index_t, typename value_t, typename = std::enable_if<std::is_integral_v<index_t>&& std::is_default_constructible_v<value_t>&& std::is_copy_assignable_v<value_t>>>
 	class BitmappedBlockSkipList {
 	protected:
 		/**
@@ -76,29 +84,67 @@ namespace bbsl {
 		 * In order to compress the memory occupied by a single node, we do not apply STL containers
 		 */
 		struct SkipListNode {
-			SkipListNode** nodes = nullptr;		//right = level*2 ,left = level * 2 + 1
 			index_t baseIndex;					//The array is offset by the index, which is almost unmodified
-
-			bitMap_t bitMap = 0;				//use bitMap to manage
+			bitMap_t bitMap;					//use bitMap to manage
 			uint8_t node_capacity;				//real capacity = *2
 			uint8_t level;						//height
 
-			value_t elements[capacity_count];	//inline elements, avoid extra allocation when the node is not full, and the capacity is not large
+			value_t* elements = nullptr;		//separate fixed-size storage, element addresses survive node reallocs
+			SkipListNode* nodes[];				//flexible: right = level*2, left = level*2 + 1
 
 		public:
-			SkipListNode(const index_t baseIndex = 0, const uint8_t level = 0) {
-				this->baseIndex = baseIndex;
-				this->node_capacity = bits::ceil<uint8_t>(level + 1);
-				this->level = level;
+			SkipListNode() = delete;
+			~SkipListNode() = delete;
 
-				//allocate nodePtrs
-				this->nodes = bbsl::_realloc(this->nodes, 0, this->node_capacity << 1);
-				std::fill_n(this->nodes, this->node_capacity << 1, nullptr);
+			static size_t blockSize(const uint8_t capacity) {
+				return sizeof(SkipListNode) + sizeof(SkipListNode*) * capacity * 2;
 			}
 
-			~SkipListNode() {
-				//no ownership
-				bbsl::_realloc(this->nodes, this->node_capacity << 1, 0);
+			static SkipListNode* create(const index_t baseIndex, const uint8_t level, const bool withElements = true) {
+				const uint8_t capacity = bits::ceil<uint8_t>(level + 1);
+				SkipListNode* node = static_cast<SkipListNode*>(bbsl::_reallocBytes(nullptr, blockSize(capacity)));
+
+				node->elements = nullptr;
+				if (withElements) {
+					//the buffer is allocated once and never moves, so any default constructible
+					//and copy assignable type works, triviality is not required anymore
+					node->elements = new value_t[bbsl::capacity_count];
+				}
+
+				node->baseIndex = baseIndex;
+				node->bitMap = 0;
+				node->node_capacity = capacity;
+				node->level = level;
+				std::fill_n(node->nodes, capacity << 1, nullptr);
+				return node;
+			}
+
+			static void destroy(SkipListNode* node) {
+				delete[] node->elements;
+				bbsl::_reallocBytes(node, 0);
+			}
+
+			/**
+			 * @brief	raises the level by one, reallocating the block when capacity runs out.
+			 *			the block may MOVE, the returned pointer is the node's new address and
+			 *			the caller must rebind every neighbor still pointing at the old one.
+			 * @param	node
+			 * @return
+			 */
+			static SkipListNode* grow(SkipListNode* node) {
+				++node->level;
+				if (node->level < node->node_capacity) {
+					node->nodes[node->level << 1] = nullptr;
+					node->nodes[(node->level << 1) | 1] = nullptr;
+					return node;
+				}
+
+				const uint8_t newCapacity = node->node_capacity << 1;
+				SkipListNode* moved = static_cast<SkipListNode*>(bbsl::_reallocBytes(node, blockSize(newCapacity)));
+
+				moved->node_capacity = newCapacity;
+				std::fill_n(moved->nodes + (moved->level << 1), (newCapacity - moved->level) << 1, nullptr);
+				return moved;
 			}
 
 			/**
@@ -148,16 +194,6 @@ namespace bbsl {
 			void deleteElement(const uint8_t index) {
 				//if (index >= bbsl::capacity_count) return;
 				bits::set_zero(this->bitMap, index);
-			}
-
-			void increaseLevel() {
-				if ((this->level + 1) >= this->node_capacity) {
-					uint8_t newCapacity = this->node_capacity << 1;
-					this->nodes = bbsl::_realloc(this->nodes, this->node_capacity << 1, newCapacity << 1);
-					this->node_capacity = newCapacity;
-				}
-				++this->level;
-				std::fill_n(this->nodes + (this->level << 1), 2, nullptr);
 			}
 
 			void decreaseLevel() {
@@ -215,11 +251,11 @@ namespace bbsl {
 
 	protected:
 		mutable SkipListNode* leftPathNodes[32] = { nullptr };
-		slab::ObjectPool<SkipListNode> nodePool;
 		bbsl::Xoroshiro64StarStar rng;
 
-		SkipListNode sentryHead;
-		SkipListNode sentryTail;
+		//heap allocated with pre-sized capacity (level 31), so grow() never moves them
+		SkipListNode* sentryHead;
+		SkipListNode* sentryTail;
 
 		uint64_t width = 0;//the node count
 		int64_t level = 0;//the height
@@ -229,13 +265,13 @@ namespace bbsl {
 		//check if need add level
 		void increaseLevel() {
 			// 1. level up sentry
-			this->sentryHead.increaseLevel();
-			this->sentryTail.increaseLevel();
+			++this->sentryHead->level;
+			++this->sentryTail->level;
 			++this->level;
 
 			// 2. get nodes witch level == this->level - 1
-			SkipListNode* node = this->sentryHead.getRightNode(this->level - 1);
-			SkipListNode* left = &this->sentryHead;
+			SkipListNode* node = this->sentryHead->getRightNode(this->level - 1);
+			SkipListNode* left = this->sentryHead;
 
 			while (node->level < (this->level - 1)) {
 				node = node->getRightNode(this->level - 1);
@@ -244,10 +280,30 @@ namespace bbsl {
 			//at least one node
 			bool promoted = false;
 
-			while (node != &this->sentryTail) {
+			while (node != this->sentryTail) {
 				// 50% percent
 				if ((this->rng.next() & 1) || !promoted) {
-					node->increaseLevel();
+					// grow() may move the block, rebind every neighbor afterwards
+					const uint8_t lvl = node->level;
+					SkipListNode* preds[32];
+					SkipListNode* succs[32];
+					for (uint8_t i = 0; i <= lvl; ++i) {
+						preds[i] = node->getLeftNode(i);
+						succs[i] = node->getRightNode(i);
+					}
+
+					SkipListNode* old = node;
+					node = SkipListNode::grow(node);
+					if (node != old) {
+						for (uint8_t i = 0; i <= lvl; ++i) {
+							preds[i]->setRightNode(i, node);
+							succs[i]->setLeftNode(i, node);
+						}
+						for (uint8_t i = 0; i <= lvl; ++i) {
+							if (this->leftPathNodes[i] == old) this->leftPathNodes[i] = node;
+						}
+					}
+
 					// connect node
 					node->setLeftNode(this->level, left);
 					left->setRightNode(this->level, node);
@@ -259,14 +315,14 @@ namespace bbsl {
 			}
 
 			//connect
-			left->setRightNode(this->level, &this->sentryTail);
-			this->sentryTail.setLeftNode(this->level, left);
+			left->setRightNode(this->level, this->sentryTail);
+			this->sentryTail->setLeftNode(this->level, left);
 		}
 
 		//check if need sub level
 		void decreaseLevel() {
 			//level down all node that level == this.level
-			SkipListNode* node = &this->sentryHead;
+			SkipListNode* node = this->sentryHead;
 
 			while (node != nullptr) {
 				SkipListNode* right = node->getRightNode(this->level);
@@ -288,17 +344,44 @@ namespace bbsl {
 		}
 
 		/**
+		 * @brief	find the node with the maximum baseIndex <= index, recording only the level-0 cache slot
+		 *			used by read paths, so they skip all other path stores
+		 * @param	index
+		 * @return
+		 */
+		SkipListNode* findNodeNoPath(const index_t index) const {
+			SkipListNode* node = this->sentryHead;
+			auto curLevel = this->level;
+
+			while (curLevel >= 0) {
+				auto next = node->getRightNode(curLevel);
+				// check next node, if it is the tail sentinel, then go down a level
+				if (next != this->sentryTail && next->baseIndex <= index) {
+					node = next;
+				}
+				else {
+					--curLevel;
+				}
+			}
+
+			// keep the level-0 cache slot warm, so sequential access keeps hitting the quick path
+			this->leftPathNodes[0] = node;
+			return node;
+		}
+
+		/**
 		 * @brief
 		 * @param index
+		 * @return
 		 */
 		SkipListNode* findLeftNode(const index_t index) const {
-			SkipListNode* node = const_cast<SkipListNode*>(&this->sentryHead);
+			SkipListNode* node = this->sentryHead;
 			auto curLevel = this->level;
 
 			while (curLevel >= 0) {
 				auto next = node->getRightNode(curLevel);
 				// check next node, if it is nullptr, then go down a level
-				if (next != &this->sentryTail && next->baseIndex <= index) {
+				if (next != this->sentryTail && next->baseIndex <= index) {
 					node = next;
 				}
 				else {
@@ -318,8 +401,7 @@ namespace bbsl {
 		SkipListNode* insertNode(const index_t index) {
 			//make node
 			const auto level = this->getRandomLevel();
-			SkipListNode* newNode = this->nodePool.allocate(index, level);
-			//new SkipListNode(index, level);
+			SkipListNode* newNode = SkipListNode::create(index, level);
 
 			//connect
 			SkipListNode* left = nullptr, * right = nullptr;
@@ -339,6 +421,8 @@ namespace bbsl {
 			++this->width;
 			if (this->width >= (1ULL << this->level)) {
 				increaseLevel();
+				// grow() during the level up may have moved this block, re-derive the address
+				newNode = this->findLeftNode(index);
 			}
 
 			return newNode;
@@ -360,8 +444,7 @@ namespace bbsl {
 				right->setLeftNode(i, left);
 			}
 
-			this->nodePool.deallocate(node);
-			//delete node;
+			SkipListNode::destroy(node);
 			--this->width;
 
 			// remind: we set path node after remove, so we never get invalid path node0
@@ -382,8 +465,14 @@ namespace bbsl {
 		BitmappedBlockSkipList(const value_t& invalid) {
 			this->invalid = invalid;
 
-			this->sentryHead.setRightNode(0, &this->sentryTail);
-			this->sentryTail.setLeftNode(0, &this->sentryHead);
+			//pre-size the sentries for the maximum level so grow() never moves them
+			this->sentryHead = SkipListNode::create(0, 31, false);
+			this->sentryTail = SkipListNode::create(0, 31, false);
+			this->sentryHead->level = 0;
+			this->sentryTail->level = 0;
+
+			this->sentryHead->setRightNode(0, this->sentryTail);
+			this->sentryTail->setLeftNode(0, this->sentryHead);
 		}
 
 		/**
@@ -394,22 +483,27 @@ namespace bbsl {
 		BitmappedBlockSkipList(const value_t& invalid, uint64_t seed) {
 			this->invalid = invalid;
 
-			this->sentryHead.setRightNode(0, &this->sentryTail);
-			this->sentryTail.setLeftNode(0, &this->sentryHead);
+			this->sentryHead = SkipListNode::create(0, 31, false);
+			this->sentryTail = SkipListNode::create(0, 31, false);
+			this->sentryHead->level = 0;
+			this->sentryTail->level = 0;
+
+			this->sentryHead->setRightNode(0, this->sentryTail);
+			this->sentryTail->setLeftNode(0, this->sentryHead);
 
 			rng.seed(seed);
 		}
 
 		~BitmappedBlockSkipList() {
 			// release one by one
-			SkipListNode* node = this->sentryHead.getRightNode(0);
-			while (node != nullptr && node != &this->sentryTail) {
+			SkipListNode* node = this->sentryHead->getRightNode(0);
+			while (node != nullptr && node != this->sentryTail) {
 				SkipListNode* next = node->getRightNode(0);
-				this->nodePool.deallocate(node);
-				//delete node;
+				SkipListNode::destroy(node);
 				node = next;
 			}
-			// no need to free sentry node
+			SkipListNode::destroy(this->sentryHead);
+			SkipListNode::destroy(this->sentryTail);
 		}
 
 		int64_t getLevel() {
@@ -424,9 +518,9 @@ namespace bbsl {
 		bool has(const index_t index) const {
 			if (this->width == 0) return false;
 
-			SkipListNode* node = this->findLeftNode(index);
+			SkipListNode* node = this->findNodeNoPath(index);
 			// now node is the maximum node with baseIndex <= index
-			if (node != &this->sentryHead && node->baseIndex <= index && SkipListNode::isIndexValid(index - node->baseIndex)) {
+			if (node != this->sentryHead && node->baseIndex <= index && SkipListNode::isIndexValid(index - node->baseIndex)) {
 				return node->hasElement(index - node->baseIndex);
 			}
 			return false;
@@ -439,15 +533,19 @@ namespace bbsl {
 		bool erase(const index_t index) {
 			if (this->width == 0) return false;
 
-			SkipListNode* node = this->findLeftNode(index);
+			SkipListNode* node = this->findNodeNoPath(index);
 			// now node is the maximum node with baseIndex <= index
-			if (node != &this->sentryHead && node->baseIndex <= index && SkipListNode::isIndexValid(index - node->baseIndex)) {
+			if (node != this->sentryHead && node->baseIndex <= index && SkipListNode::isIndexValid(index - node->baseIndex)) {
 				uint8_t offset = static_cast<uint8_t>(index - node->baseIndex);
 				if (node->hasElement(offset)) {
 					node->deleteElement(offset);
 
 					//remove node
-					if (node->isEmpty()) this->removeNode(node);
+					if (node->isEmpty()) {
+						// unlinking needs the descent path, rebuild it here
+						this->findLeftNode(index);
+						this->removeNode(node);
+					}
 					return true;
 				}
 			}
@@ -462,7 +560,7 @@ namespace bbsl {
 		value_t& operator[](const index_t index) {
 			// quick path: we dont need full node path when setting exist element, so we directly find left node[0] and check
 			SkipListNode* cachedNode = this->leftPathNodes[0];
-			if (cachedNode != nullptr && cachedNode != &this->sentryHead && cachedNode->baseIndex <= index && SkipListNode::isIndexValid(index - cachedNode->baseIndex)) {
+			if (cachedNode != nullptr && cachedNode != this->sentryHead && cachedNode->baseIndex <= index && SkipListNode::isIndexValid(index - cachedNode->baseIndex)) {
 				uint8_t offset = static_cast<uint8_t>(index - cachedNode->baseIndex);
 				if (!cachedNode->hasElement(offset)) {
 					cachedNode->setElement(offset, this->invalid);
@@ -473,7 +571,7 @@ namespace bbsl {
 
 			SkipListNode* node = this->findLeftNode(index);
 
-			if (node != &this->sentryHead && node->baseIndex <= index && SkipListNode::isIndexValid(index - node->baseIndex)) {
+			if (node != this->sentryHead && node->baseIndex <= index && SkipListNode::isIndexValid(index - node->baseIndex)) {
 				uint8_t offset = static_cast<uint8_t>(index - node->baseIndex);
 				if (!node->hasElement(offset)) {
 					node->setElement(offset, this->invalid);
@@ -498,7 +596,7 @@ namespace bbsl {
 		const value_t& operator[](const index_t index) const {
 			// quick path: we dont need full node path when setting exist element, so we directly find left node[0] and check
 			SkipListNode* cachedNode = this->leftPathNodes[0];
-			if (cachedNode != nullptr && cachedNode != &this->sentryHead && cachedNode->baseIndex <= index && SkipListNode::isIndexValid(index - cachedNode->baseIndex)) {
+			if (cachedNode != nullptr && cachedNode != this->sentryHead && cachedNode->baseIndex <= index && SkipListNode::isIndexValid(index - cachedNode->baseIndex)) {
 				uint8_t offset = static_cast<uint8_t>(index - cachedNode->baseIndex);
 
 				if (cachedNode->hasElement(offset)) {
@@ -506,8 +604,8 @@ namespace bbsl {
 				}
 			}
 
-			SkipListNode* node = this->findLeftNode(index);
-			if (node != &this->sentryHead && node->baseIndex <= index && SkipListNode::isIndexValid(index - node->baseIndex)) {
+			SkipListNode* node = this->findNodeNoPath(index);
+			if (node != this->sentryHead && node->baseIndex <= index && SkipListNode::isIndexValid(index - node->baseIndex)) {
 				uint8_t offset = static_cast<uint8_t>(index - node->baseIndex);
 
 				if (node->hasElement(offset)) {
@@ -521,10 +619,20 @@ namespace bbsl {
 	public:
 		template<typename Func>
 		void forEach(Func func) const {
-			SkipListNode* node = this->sentryHead.getRightNode(0);
-			while (node != nullptr && node != &this->sentryTail) {
-				for (int8_t i = SkipListNode::begin(node); i != -1; i = SkipListNode::next(node, i)) {
-					func(node->elements[i], node->baseIndex + i);
+			SkipListNode* node = this->sentryHead->getRightNode(0);
+			while (node != nullptr && node != this->sentryTail) {
+				// dense fast path: every slot is occupied, iterate sequentially without bit tests
+				if (node->bitMap == std::numeric_limits<bitMap_t>::max()) {
+					const index_t base = node->baseIndex;
+					const value_t* elements = node->elements;
+					for (uint8_t i = 0; i < bbsl::capacity_count; ++i) {
+						func(elements[i], base + i);
+					}
+				}
+				else {
+					for (int8_t i = SkipListNode::begin(node); i != -1; i = SkipListNode::next(node, i)) {
+						func(node->elements[i], node->baseIndex + i);
+					}
 				}
 				node = node->getRightNode(0);
 			}
@@ -532,10 +640,20 @@ namespace bbsl {
 
 		template<typename Func>
 		bool some(Func func) const {
-			SkipListNode* node = this->sentryHead.getRightNode(0);
-			while (node != nullptr && node != &this->sentryTail) {
-				for (int8_t i = SkipListNode::begin(node); i != -1; i = SkipListNode::next(node, i)) {
-					if (func(node->elements[i], node->baseIndex + i)) return true;
+			SkipListNode* node = this->sentryHead->getRightNode(0);
+			while (node != nullptr && node != this->sentryTail) {
+				// dense fast path: every slot is occupied, iterate sequentially without bit tests
+				if (node->bitMap == std::numeric_limits<bitMap_t>::max()) {
+					const index_t base = node->baseIndex;
+					const value_t* elements = node->elements;
+					for (uint8_t i = 0; i < bbsl::capacity_count; ++i) {
+						if (func(elements[i], base + i)) return true;
+					}
+				}
+				else {
+					for (int8_t i = SkipListNode::begin(node); i != -1; i = SkipListNode::next(node, i)) {
+						if (func(node->elements[i], node->baseIndex + i)) return true;
+					}
 				}
 				node = node->getRightNode(0);
 			}
@@ -544,10 +662,20 @@ namespace bbsl {
 
 		template<typename Func>
 		bool every(Func func) const {
-			SkipListNode* node = this->sentryHead.getRightNode(0);
-			while (node != nullptr && node != &this->sentryTail) {
-				for (int8_t i = SkipListNode::begin(node); i != -1; i = SkipListNode::next(node, i)) {
-					if (!func(node->elements[i], node->baseIndex + i)) return false;
+			SkipListNode* node = this->sentryHead->getRightNode(0);
+			while (node != nullptr && node != this->sentryTail) {
+				// dense fast path: every slot is occupied, iterate sequentially without bit tests
+				if (node->bitMap == std::numeric_limits<bitMap_t>::max()) {
+					const index_t base = node->baseIndex;
+					const value_t* elements = node->elements;
+					for (uint8_t i = 0; i < bbsl::capacity_count; ++i) {
+						if (!func(elements[i], base + i)) return false;
+					}
+				}
+				else {
+					for (int8_t i = SkipListNode::begin(node); i != -1; i = SkipListNode::next(node, i)) {
+						if (!func(node->elements[i], node->baseIndex + i)) return false;
+					}
 				}
 				node = node->getRightNode(0);
 			}
@@ -589,7 +717,7 @@ namespace bbsl {
 
 				if (nextIndex == -1) {
 					this->node = this->node->getRightNode(0);
-					if (this->node != nullptr && this->node != &this->skiplist->sentryTail) {
+					if (this->node != nullptr && this->node != this->skiplist->sentryTail) {
 						this->inside_index = SkipListNode::begin(this->node);
 					}
 					else {
@@ -609,7 +737,7 @@ namespace bbsl {
 				int8_t prevIndex = SkipListNode::prev(this->node, this->inside_index);
 				if (prevIndex == -1) {
 					this->node = this->node->getLeftNode(0);
-					if (this->node != nullptr && this->node != &this->skiplist->sentryHead) {
+					if (this->node != nullptr && this->node != this->skiplist->sentryHead) {
 						this->inside_index = SkipListNode::end(this->node);
 					}
 					else {
@@ -637,9 +765,9 @@ namespace bbsl {
 		};
 
 		IterObject begin() {
-			SkipListNode* node = this->sentryHead.getRightNode(0);
+			SkipListNode* node = this->sentryHead->getRightNode(0);
 
-			if (node == &this->sentryTail) {
+			if (node == this->sentryTail) {
 				return IterObject(this, nullptr, 0);
 			}
 			else {
@@ -653,9 +781,9 @@ namespace bbsl {
 
 		// reverse
 		IterObject rbegin() {
-			SkipListNode* node = this->sentryTail.getLeftNode(0);
+			SkipListNode* node = this->sentryTail->getLeftNode(0);
 
-			if (node == &this->sentryHead) {
+			if (node == this->sentryHead) {
 				return IterObject(this, nullptr, 0);
 			}
 			else {
@@ -665,6 +793,42 @@ namespace bbsl {
 
 		IterObject rend() {
 			return IterObject(this, nullptr, 0);
+		}
+
+		/**
+		 * @brief	first element with key >= index
+		 *			one descent, then walk the level-0 chain, so a range scan costs O(log n) once instead of per element
+		 * @param	index
+		 * @return
+		 */
+		IterObject lowerBound(const index_t index) {
+			if (this->width == 0) return IterObject(this, nullptr, 0);
+
+			SkipListNode* node = this->findNodeNoPath(index);
+			// now node is the maximum node with baseIndex <= index (or the head sentinel)
+			if (node != this->sentryHead && node->baseIndex <= index && SkipListNode::isIndexValid(index - node->baseIndex)) {
+				const uint8_t offset = static_cast<uint8_t>(index - node->baseIndex);
+				// first set bit at or after offset inside this block
+				const bitMap_t candidateBits = node->bitMap & static_cast<bitMap_t>(~((1u << offset) - 1));
+				if (candidateBits != 0) {
+					return IterObject(this, node, static_cast<int8_t>(bits::ctz64(candidateBits)));
+				}
+			}
+
+			// nothing at/after index inside the node, the chain is key sorted: next block's begin
+			SkipListNode* next = node->getRightNode(0);
+			if (next == this->sentryTail || next == nullptr) return IterObject(this, nullptr, 0);
+			return IterObject(this, next, SkipListNode::begin(next));
+		}
+
+		/**
+		 * @brief	first element with key > index
+		 * @param	index
+		 * @return
+		 */
+		IterObject upperBound(const index_t index) {
+			if (index == std::numeric_limits<index_t>::max()) return IterObject(this, nullptr, 0);
+			return this->lowerBound(index + 1);
 		}
 	};
 }

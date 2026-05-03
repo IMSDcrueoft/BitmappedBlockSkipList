@@ -13,7 +13,6 @@ I designed it to serve as the underlying support for **Arrays** for the **interp
 - **Bitmap indexing** – A configurable bitmap tracks which slots within a block are occupied, enabling O(1) presence checks.
 - **Skip list indexing** – Blocks are organized as a skip list, providing expected O(log n) search, insert, and delete.
 - **Self‑adjusting levels** – Skip list height automatically scales with the number of blocks.
-- **Object pool allocation** – Uses a custom slab allocator for fast node allocation/deallocation.
 - **STL‑style iterators** – Forward and reverse iteration with begin/end/rbegin/rend support.
 - **Functional traversal** – `forEach`, `some`, `every` methods for efficient bulk operations.
 
@@ -77,10 +76,6 @@ for (int8_t i = SkipListNode::begin(node); i != -1; i = SkipListNode::next(node,
 }
 ```
 
-### Object Pool Allocation
-- Custom `slab::ObjectPool` eliminates per‑node heap allocation overhead
-- Batch allocation improves memory locality and reduces fragmentation
-
 ### STL‑Compatible Iterators
 - Forward iterator (`begin()` / `end()`)
 - Reverse iterator (`rbegin()` / `rend()`)
@@ -93,7 +88,6 @@ for (int8_t i = SkipListNode::begin(node); i != -1; i = SkipListNode::next(node,
 | `SkipListNode`          | Block containing inline elements, bitmap, and level pointers |
 | `BitmappedBlockSkipList` | Main container with sentinel head/tail and automatic level adjustment |
 | `Xoroshiro64StarStar`   | Fast RNG for probabilistic level assignment |
-| `slab::ObjectPool`      | Custom allocator for node pooling |
 | `bits.hpp`              | Optimized bit operations (popcount, ctz, clz, etc.) |
 
 ## 📈 When to Use BBSL
