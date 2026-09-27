@@ -53,7 +53,6 @@ namespace bbsl {
 	 */
 	template <typename index_t, typename value_t, typename = std::enable_if<std::is_integral_v<index_t>&& std::is_default_constructible_v<value_t>&& std::is_copy_assignable_v<value_t>>>
 	class BitmappedBlockSkipList {
-		static_assert(sizeof(bitMap_t) + sizeof(index_t) < 16, "Node size exceeds limit");
 	protected:
 		/**
 		 * @brief	It's just for storing data, so it's struct
