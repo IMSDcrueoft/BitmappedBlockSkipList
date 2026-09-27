@@ -16,12 +16,27 @@
 
 namespace bbsl {
 	/**
+	 * @brief	compile-time allocation accounting seam: by default it expands to nothing,
+	 *			so the release path carries zero cost - not even the argument evaluation.
+	 *			a translation unit that wants exact requested-byte accounting defines
+	 *			BBSL_REALLOC_HOOK(ob, nb) before including this header, with
+	 *			ob = previous block size and nb = new block size of every node realloc
+	 */
+	#ifndef BBSL_REALLOC_HOOK
+		#define BBSL_REALLOC_HOOK(ob, nb)
+	#endif
+
+	/**
 	 * @brief	byte granularity realloc: nullptr in allocates, zero size out frees.
 	 *			every node allocation goes through here so the allocator can be swapped in one place.
+	 * @param	oldBytes	previous block size, reported to BBSL_REALLOC_HOOK on realloc/free
 	 */
-	inline void* _reallocBytes(void* pointer, const size_t newBytes) {
+	inline void* reallocBytes(void* pointer, const size_t newBytes, const size_t oldBytes = 0) {
 		if (newBytes == 0) {
-			if (pointer != nullptr) std::free(pointer);
+			if (pointer != nullptr) {
+				BBSL_REALLOC_HOOK(oldBytes, 0);
+				std::free(pointer);
+			}
 			return nullptr;
 		}
 
@@ -31,6 +46,7 @@ namespace bbsl {
 			exit(1);
 		}
 
+		BBSL_REALLOC_HOOK(pointer != nullptr ? oldBytes : 0, newBytes);
 		return result;
 	}
 
@@ -61,7 +77,7 @@ namespace bbsl {
 		}
 	};
 
-	using bitMap_t = uint16_t;
+	using bitMap_t = uint8_t;
 	constexpr uint64_t capacity_count = sizeof(bitMap_t) * 8;
 	constexpr uint64_t index_align = (capacity_count - 1); // Align to capacity limit
 
@@ -102,7 +118,7 @@ namespace bbsl {
 
 			static SkipListNode* create(const index_t baseIndex, const uint8_t level, const bool withElements = true) {
 				const uint8_t capacity = bits::ceil<uint8_t>(level + 1);
-				SkipListNode* node = static_cast<SkipListNode*>(bbsl::_reallocBytes(nullptr, blockSize(capacity)));
+				SkipListNode* node = static_cast<SkipListNode*>(bbsl::reallocBytes(nullptr, blockSize(capacity)));
 
 				node->elements = nullptr;
 				if (withElements) {
@@ -121,7 +137,7 @@ namespace bbsl {
 
 			static void destroy(SkipListNode* node) {
 				delete[] node->elements;
-				bbsl::_reallocBytes(node, 0);
+				bbsl::reallocBytes(node, 0, blockSize(node->node_capacity));
 			}
 
 			/**
@@ -140,7 +156,8 @@ namespace bbsl {
 				}
 
 				const uint8_t newCapacity = node->node_capacity << 1;
-				SkipListNode* moved = static_cast<SkipListNode*>(bbsl::_reallocBytes(node, blockSize(newCapacity)));
+				const size_t oldBytes = blockSize(node->node_capacity);
+				SkipListNode* moved = static_cast<SkipListNode*>(bbsl::reallocBytes(node, blockSize(newCapacity), oldBytes));
 
 				moved->node_capacity = newCapacity;
 				std::fill_n(moved->nodes + (moved->level << 1), (newCapacity - moved->level) << 1, nullptr);

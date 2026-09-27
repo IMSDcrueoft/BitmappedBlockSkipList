@@ -13,7 +13,7 @@
 #include "./bits.hpp"
 
 namespace bbrb {
-	using bitMap_t = uint16_t;
+	using bitMap_t = uint8_t;
 	constexpr uint64_t capacity_count = sizeof(bitMap_t) * 8;
 	constexpr uint64_t index_align = (capacity_count - 1); // Align to capacity limit
 	constexpr bitMap_t fullBitMap = std::numeric_limits<bitMap_t>::max(); // every slot is occupied

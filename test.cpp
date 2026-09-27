@@ -3,6 +3,12 @@
  * Copyright (c) 2026 IMSDcrueoft (https://github.com/IMSDcrueoft)
  * See LICENSE file in the root directory for full license text.
 */
+#include <cstddef>
+
+// exact requested-byte accounting for bbsl node blocks: declared here, defined in the
+// memcount namespace below; the macro bakes the call into _reallocBytes with no branch
+namespace memcount { void accountBlock(size_t oldBytes, size_t newBytes); }
+#define BBSL_REALLOC_HOOK(ob, nb) memcount::accountBlock((ob), (nb))
 #include "./src/bbsl.hpp"
 #include "./src/bbrb.hpp"
 #include <cmath>
@@ -16,18 +22,7 @@
 #include <unordered_map>
 #include <memory>
 #include <cstdlib>
-#include <fstream>
-
-#if defined(_WIN32)
-    #define NOMINMAX
-    #include <windows.h>
-    #include <psapi.h>
-    #include <malloc.h>
-#elif defined(__APPLE__)
-    #include <mach/mach.h>
-#elif defined(__linux__)
-    #include <malloc.h>
-#endif
+#include <new>
 
 constexpr auto testCount = 1'000'000;
 using namespace bbsl;
@@ -1208,79 +1203,120 @@ void test_sparse_traversal_performance_bbrb() {
 
 // ============= Memory Footprint Tests =============
 
-// commit/resident charge of the whole process, includes every heap node of a live container
-size_t getCommit() {
-#if defined(_WIN32)
-    PROCESS_MEMORY_COUNTERS pmc{};
-    GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
-    return static_cast<size_t>(pmc.PagefileUsage);
-#elif defined(__APPLE__)
-    mach_task_basic_info_data_t info{};
-    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
-    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS) {
-        return static_cast<size_t>(info.resident_size);
+// exact requested-byte accounting at the allocation seam: every operator new/delete
+// and every bbsl node block is recorded while a measurement window is open, so the
+// reported numbers exclude allocator bucket rounding and per-allocation overhead
+// entirely (and transfer to any future custom allocator)
+namespace memcount {
+    bool enabled = false;
+    size_t liveBytes = 0;
+    uint64_t allocCount = 0;
+
+    // non-allocating pointer registry: open addressing with tombstones, so deallocation
+    // exact sizes are known even for unsized delete calls (trivial-type arrays etc.)
+    constexpr size_t kTableBits = 21;
+    constexpr size_t kTableSlots = size_t(1) << kTableBits;
+    struct Entry { void* ptr; size_t size; };
+    Entry table[kTableSlots];   // zero-initialized: ptr == nullptr means empty slot
+
+    size_t slotOf(void* p) {
+        return (reinterpret_cast<size_t>(p) >> 4) * 0x9E3779B97F4A7C15ULL >> (64 - kTableBits);
     }
-    return 0;
-#elif defined(__linux__)
-    // resident set size, the pragmatic analog of commit charge for a fully write-touched container
-    std::ifstream status("/proc/self/status");
-    std::string line;
-    while (std::getline(status, line)) {
-        if (line.rfind("VmRSS:", 0) == 0) {
-            return static_cast<size_t>(std::strtol(line.c_str() + 6, nullptr, 10)) * 1024;
+
+    void record(void* p, size_t n) {
+        if (!enabled || p == nullptr) return;
+        size_t i = slotOf(p);
+        size_t tomb = SIZE_MAX;
+        for (size_t probes = 0; probes < kTableSlots; ++probes) {
+            if (table[i].ptr == nullptr) {
+                if (tomb != SIZE_MAX) i = tomb;
+                table[i].ptr = p;
+                table[i].size = n;
+                liveBytes += n;
+                ++allocCount;
+                return;
+            }
+            if (table[i].size == 0 && tomb == SIZE_MAX) tomb = i;
+            i = (i + 1) & (kTableSlots - 1);
+        }
+        // registry saturated: the record is dropped, metrics degrade but nothing crashes
+    }
+
+    void release(void* p) {
+        if (p == nullptr) return;
+        size_t i = slotOf(p);
+        for (size_t probes = 0; probes < kTableSlots && table[i].ptr != nullptr; ++probes) {
+            if (table[i].ptr == p && table[i].size != 0) {
+                if (enabled) liveBytes -= table[i].size;
+                table[i].size = 0;   // tombstone, the probe chain stays intact
+                return;
+            }
+            i = (i + 1) & (kTableSlots - 1);
         }
     }
-    return 0;
-#else
-    return 0;
-#endif
+
+    struct Scope {
+        Scope() { liveBytes = 0; allocCount = 0; enabled = true; }
+        ~Scope() { enabled = false; }
+    };
+
+    // bbsl node blocks bypass operator new (malloc/realloc seam), so their byte deltas
+    // arrive through bbsl::_reallocHook with explicit old/new sizes instead of the registry
+    void accountBlock(size_t oldBytes, size_t newBytes) {
+        if (!enabled) return;
+        if (oldBytes == 0 && newBytes > 0) ++allocCount;
+        liveBytes = static_cast<size_t>(static_cast<int64_t>(liveBytes)
+            + static_cast<int64_t>(newBytes) - static_cast<int64_t>(oldBytes));
+    }
 }
 
-// release freed-but-retained heap blocks, otherwise the next pass reuses them and the
-// measurement delta under-reports the container size (fatally for small containers)
-void shrinkHeap() {
-#if defined(_WIN32)
-    _heapmin();
-    HeapCompact(GetProcessHeap(), 0);
-#elif defined(__GLIBC__)
-    malloc_trim(0);
-#else
-    // no portable heap compaction on this platform, the two-pass measurement still absorbs most of the bias
-#endif
+void* operator new(const size_t size) {
+    void* p = std::malloc(size == 0 ? 1 : size);
+    if (p == nullptr) throw std::bad_alloc();
+    memcount::record(p, size);
+    return p;
 }
 
-// measures the commit delta while the container is alive; two passes, the second one is reported
-// so first-touch / heap-segment growth noise lands in pass 1
+void* operator new[](const size_t size) {
+    return ::operator new(size);
+}
+
+void operator delete(void* p) noexcept {
+    memcount::release(p);
+    std::free(p);
+}
+
+void operator delete[](void* p) noexcept {
+    ::operator delete(p);
+}
+
+void operator delete(void* p, const size_t) noexcept { ::operator delete(p); }
+void operator delete[](void* p, const size_t) noexcept { ::operator delete(p); }
+
+// measures the exact requested bytes of a live container through the allocation seam
 template<typename T, typename Make, typename Fill>
 void measureMemory(const char* name, uint64_t elementCount, Make&& make, Fill&& fill) {
-    // pass 1: warm the heap
-    {
-        std::unique_ptr<T> c = make();
-        fill(*c);
-    }
-
-    shrinkHeap();
-    const size_t base = getCommit();
     size_t live = 0;
+    uint64_t allocs = 0;
     {
+        memcount::Scope scope;
         std::unique_ptr<T> c = make();
         fill(*c);
-        live = getCommit() - base;
+        live = memcount::liveBytes;
+        allocs = memcount::allocCount;
     }
-    shrinkHeap();
-    const size_t after = getCommit();
-    const size_t lingering = after > base ? after - base : 0;
 
     const double mb = static_cast<double>(live) / (1024.0 * 1024.0);
     const double bpe = elementCount ? static_cast<double>(live) / static_cast<double>(elementCount) : 0.0;
-    std::cout << "  [" << name << "] " << mb << " MB, " << bpe << " B/elem"
-        << " (lingering after free: " << lingering << " bytes)" << std::endl;
+    std::cout << "  [" << name << "] " << mb << " MB, " << bpe << " B/elem, "
+        << allocs << " allocations" << std::endl;
 }
 
 void test_memory_footprint() {
     const uint64_t N = testCount;
 
     std::cout << "\n========== Memory Footprint Tests ==========\n";
+    std::cout << "(exact requested bytes at the allocation seam, allocator overhead excluded)\n";
 
     // fixed per-instance cost, no heap internals exist while empty
     std::cout << "\n[Empty instance sizeof] (fixed cost per instance)\n";
@@ -1412,6 +1448,6 @@ int main() {
     test_vector_traversal_performance();
 
     test_memory_footprint();
-
+    
     return 0;
 }
