@@ -22,7 +22,6 @@
     <ClCompile Include="test.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\bbrb.hpp" />
     <ClInclude Include="src\bits.hpp" />
     <ClInclude Include="src\bbsl.hpp" />
   </ItemGroup>

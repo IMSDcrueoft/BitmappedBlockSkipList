@@ -20,19 +20,25 @@ namespace bbsl {
 	 *			so the release path carries zero cost - not even the argument evaluation.
 	 *			a translation unit that wants exact requested-byte accounting defines
 	 *			BBSL_REALLOC_HOOK(ob, nb) before including this header, with
-	 *			ob = previous block size and nb = new block size of every node realloc
+	 *			ob = previous byte size and nb = new byte size of every node realloc
 	 */
 	#ifndef BBSL_REALLOC_HOOK
 		#define BBSL_REALLOC_HOOK(ob, nb)
 	#endif
 
 	/**
-	 * @brief	byte granularity realloc: nullptr in allocates, zero size out frees.
-	 *			every node allocation goes through here so the allocator can be swapped in one place.
-	 * @param	oldBytes	previous block size, reported to BBSL_REALLOC_HOOK on realloc/free
+	 * @brief	object granularity realloc: nullptr in allocates, zero count out frees.
+	 *			every node pointer-array allocation goes through here so the allocator can be swapped in one place.
+	 * @param	pointer		existing buffer or nullptr
+	 * @param	oldCount	previous object count, reported to BBSL_REALLOC_HOOK on realloc/free
+	 * @param	newCount	new object count, zero frees the buffer
 	 */
-	inline void* reallocBytes(void* pointer, const size_t newBytes, const size_t oldBytes = 0) {
-		if (newBytes == 0) {
+	template<typename T, typename = std::enable_if<std::is_trivial_v<T>&& std::is_standard_layout_v<T>>>
+	T* reallocObject(T* pointer, const size_t oldCount, const size_t newCount) {
+		const size_t oldBytes = sizeof(T) * oldCount;
+		const size_t newBytes = sizeof(T) * newCount;
+
+		if (newCount == 0) {
 			if (pointer != nullptr) {
 				BBSL_REALLOC_HOOK(oldBytes, 0);
 				std::free(pointer);
@@ -47,12 +53,7 @@ namespace bbsl {
 		}
 
 		BBSL_REALLOC_HOOK(pointer != nullptr ? oldBytes : 0, newBytes);
-		return result;
-	}
-
-	template<typename T, typename = std::enable_if<std::is_trivial_v<T>&& std::is_standard_layout_v<T>>>
-	T* _realloc(T* pointer, size_t oldCount, size_t newSize) {
-		return static_cast<T*>(_reallocBytes(pointer, sizeof(T) * newSize));
+		return static_cast<T*>(result);
 	}
 
 	class Xoroshiro64StarStar {
@@ -92,6 +93,7 @@ namespace bbsl {
 	 */
 	template <typename index_t, typename value_t, typename = std::enable_if<std::is_integral_v<index_t>&& std::is_default_constructible_v<value_t>&& std::is_copy_assignable_v<value_t>>>
 	class BitmappedBlockSkipList {
+		static_assert(sizeof(bitMap_t) + sizeof(index_t) < 16, "Node size exceeds limit");
 	protected:
 		/**
 		 * @brief	It's just for storing data, so it's struct
@@ -101,24 +103,22 @@ namespace bbsl {
 		 */
 		struct SkipListNode {
 			index_t baseIndex;					//The array is offset by the index, which is almost unmodified
-			bitMap_t bitMap;					//use bitMap to manage
 			uint8_t node_capacity;				//real capacity = *2
 			uint8_t level;						//height
+			bitMap_t bitMap;					//use bitMap to manage
 
-			value_t* elements = nullptr;		//separate fixed-size storage, element addresses survive node reallocs
-			SkipListNode* nodes[];				//flexible: right = level*2, left = level*2 + 1
+			value_t* elements = nullptr;		//separate fixed-size storage, element addresses survive reallocs
+			SkipListNode** nodes = nullptr;		//separate pointer array: right = level*2, left = level*2 + 1
 
 		public:
-			SkipListNode() = delete;
-			~SkipListNode() = delete;
-
-			static size_t blockSize(const uint8_t capacity) {
-				return sizeof(SkipListNode) + sizeof(SkipListNode*) * capacity * 2;
-			}
-
 			static SkipListNode* create(const index_t baseIndex, const uint8_t level, const bool withElements = true) {
 				const uint8_t capacity = bits::ceil<uint8_t>(level + 1);
-				SkipListNode* node = static_cast<SkipListNode*>(bbsl::reallocBytes(nullptr, blockSize(capacity)));
+
+				//the node is fixed size, allocated once and never moves
+				SkipListNode* node = new SkipListNode();
+
+				//T is the element type, counts are object counts: 2 pointers per level
+				node->nodes = bbsl::reallocObject<SkipListNode*>(nullptr, 0, capacity << 1);
 
 				node->elements = nullptr;
 				if (withElements) {
@@ -137,31 +137,27 @@ namespace bbsl {
 
 			static void destroy(SkipListNode* node) {
 				delete[] node->elements;
-				bbsl::reallocBytes(node, 0, blockSize(node->node_capacity));
+				bbsl::reallocObject<SkipListNode*>(node->nodes, node->node_capacity << 1, 0);
+				delete node;
 			}
 
 			/**
-			 * @brief	raises the level by one, reallocating the block when capacity runs out.
-			 *			the block may MOVE, the returned pointer is the node's new address and
-			 *			the caller must rebind every neighbor still pointing at the old one.
+			 * @brief	raises the level by one, reallocating the pointer array when capacity runs out.
+			 *			the node itself never moves, so neighbor pointers stay valid.
 			 * @param	node
-			 * @return
 			 */
-			static SkipListNode* grow(SkipListNode* node) {
+			static void grow(SkipListNode* node) {
 				++node->level;
 				if (node->level < node->node_capacity) {
 					node->nodes[node->level << 1] = nullptr;
 					node->nodes[(node->level << 1) | 1] = nullptr;
-					return node;
+					return;
 				}
 
 				const uint8_t newCapacity = node->node_capacity << 1;
-				const size_t oldBytes = blockSize(node->node_capacity);
-				SkipListNode* moved = static_cast<SkipListNode*>(bbsl::reallocBytes(node, blockSize(newCapacity), oldBytes));
-
-				moved->node_capacity = newCapacity;
-				std::fill_n(moved->nodes + (moved->level << 1), (newCapacity - moved->level) << 1, nullptr);
-				return moved;
+				node->nodes = bbsl::reallocObject<SkipListNode*>(node->nodes, node->node_capacity << 1, newCapacity << 1);
+				node->node_capacity = newCapacity;
+				std::fill_n(node->nodes + (node->level << 1), (newCapacity - node->level) << 1, nullptr);
 			}
 
 			/**
@@ -270,7 +266,7 @@ namespace bbsl {
 		mutable SkipListNode* leftPathNodes[32] = { nullptr };
 		bbsl::Xoroshiro64StarStar rng;
 
-		//heap allocated with pre-sized capacity (level 31), so grow() never moves them
+		//heap allocated with pre-sized capacity (level 31), so their pointer arrays never realloc
 		SkipListNode* sentryHead;
 		SkipListNode* sentryTail;
 
@@ -300,26 +296,8 @@ namespace bbsl {
 			while (node != this->sentryTail) {
 				// 50% percent
 				if ((this->rng.next() & 1) || !promoted) {
-					// grow() may move the block, rebind every neighbor afterwards
-					const uint8_t lvl = node->level;
-					SkipListNode* preds[32];
-					SkipListNode* succs[32];
-					for (uint8_t i = 0; i <= lvl; ++i) {
-						preds[i] = node->getLeftNode(i);
-						succs[i] = node->getRightNode(i);
-					}
-
-					SkipListNode* old = node;
-					node = SkipListNode::grow(node);
-					if (node != old) {
-						for (uint8_t i = 0; i <= lvl; ++i) {
-							preds[i]->setRightNode(i, node);
-							succs[i]->setLeftNode(i, node);
-						}
-						for (uint8_t i = 0; i <= lvl; ++i) {
-							if (this->leftPathNodes[i] == old) this->leftPathNodes[i] = node;
-						}
-					}
+					// grow() never moves the node, neighbors stay valid
+					SkipListNode::grow(node);
 
 					// connect node
 					node->setLeftNode(this->level, left);
@@ -436,10 +414,10 @@ namespace bbsl {
 			}
 
 			++this->width;
-			if (this->width >= (1ULL << this->level)) {
+			//sentries are pre-sized for level 31, so the height is capped there;
+			//the width check is the rare event, it gates the cap check off the hot path
+			if (this->width >= (1ULL << this->level) && this->level < 31) {
 				increaseLevel();
-				// grow() during the level up may have moved this block, re-derive the address
-				newNode = this->findLeftNode(index);
 			}
 
 			return newNode;
@@ -482,7 +460,7 @@ namespace bbsl {
 		BitmappedBlockSkipList(const value_t& invalid) {
 			this->invalid = invalid;
 
-			//pre-size the sentries for the maximum level so grow() never moves them
+			//pre-size the sentries for the maximum level so their pointer arrays never realloc
 			this->sentryHead = SkipListNode::create(0, 31, false);
 			this->sentryTail = SkipListNode::create(0, 31, false);
 			this->sentryHead->level = 0;
