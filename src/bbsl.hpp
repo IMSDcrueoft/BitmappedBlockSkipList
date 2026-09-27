@@ -12,50 +12,10 @@
 #include <iostream>
 #include <memory_resource>
 
-#include "./bits.hpp"
+#include "../third-party/slabAllocator/includes/bits.h"
+#include "../third-party/slabAllocator/includes/arena_slab.h"
 
 namespace bbsl {
-	/**
-	 * @brief	compile-time allocation accounting seam: by default it expands to nothing,
-	 *			so the release path carries zero cost - not even the argument evaluation.
-	 *			a translation unit that wants exact requested-byte accounting defines
-	 *			BBSL_REALLOC_HOOK(ob, nb) before including this header, with
-	 *			ob = previous byte size and nb = new byte size of every node realloc
-	 */
-	#ifndef BBSL_REALLOC_HOOK
-		#define BBSL_REALLOC_HOOK(ob, nb)
-	#endif
-
-	/**
-	 * @brief	object granularity realloc: nullptr in allocates, zero count out frees.
-	 *			every node pointer-array allocation goes through here so the allocator can be swapped in one place.
-	 * @param	pointer		existing buffer or nullptr
-	 * @param	oldCount	previous object count, reported to BBSL_REALLOC_HOOK on realloc/free
-	 * @param	newCount	new object count, zero frees the buffer
-	 */
-	template<typename T, typename = std::enable_if<std::is_trivial_v<T>&& std::is_standard_layout_v<T>>>
-	T* reallocObject(T* pointer, const size_t oldCount, const size_t newCount) {
-		const size_t oldBytes = sizeof(T) * oldCount;
-		const size_t newBytes = sizeof(T) * newCount;
-
-		if (newCount == 0) {
-			if (pointer != nullptr) {
-				BBSL_REALLOC_HOOK(oldBytes, 0);
-				std::free(pointer);
-			}
-			return nullptr;
-		}
-
-		void* result = std::realloc(pointer, newBytes);
-		if (result == nullptr) {
-			std::cerr << "Memory reallocation failed!\n";
-			exit(1);
-		}
-
-		BBSL_REALLOC_HOOK(pointer != nullptr ? oldBytes : 0, newBytes);
-		return static_cast<T*>(result);
-	}
-
 	class Xoroshiro64StarStar {
 	private:
 		uint64_t state;
@@ -108,56 +68,117 @@ namespace bbsl {
 			bitMap_t bitMap;					//use bitMap to manage
 
 			value_t* elements = nullptr;		//separate fixed-size storage, element addresses survive reallocs
-			SkipListNode** nodes = nullptr;		//separate pointer array: right = level*2, left = level*2 + 1
+			uint32_t* nodes = nullptr;			//pointer point to compressed node pointers: right = level*2, left = level*2 + 1
+		protected:
+			static inline uintptr_t segmentBase = UINTPTR_MAX;
+			// note that allocator never returns zero, zo uint32_t(0) is nullptr
+			static constexpr uint32_t compressed_nullptr = 0;
+	
+			static SkipListNode* acquire_node() {
+				if (SkipListNode::segmentBase == UINTPTR_MAX) {
+					if constexpr (sizeof(uintptr_t) == 8) {
+						if (!arenaSlab_init(&arenaSlabDefault, 36)) {
+							std::cerr << "Failed to initialize arena slab allocator!\n";
+							exit(1);
+						}
+						SkipListNode::segmentBase = arenaSlab_segmentBase(&arenaSlabDefault);
+					}
+					else {
+						if (!arenaSlab_init(&arenaSlabDefault, 28)) {
+							std::cerr << "Failed to initialize arena slab allocator!\n";
+							exit(1);
+						}
+						SkipListNode::segmentBase = 0;
+					}
+				}
+
+				void* pointer = arenaSlab_alloc(&arenaSlabDefault, sizeof(SkipListNode));
+				if (pointer == nullptr) {
+					std::cerr << "Memory allocation failed!\n";
+					exit(1);
+				}
+
+				return static_cast<SkipListNode*>(pointer);
+			}
+
+			static void restore_node(SkipListNode* node) {
+				arenaSlab_free(&arenaSlabDefault, node);
+			}
 
 		public:
+			static bool isNonNull(SkipListNode* node) {
+				return reinterpret_cast<uintptr_t>(node) > SkipListNode::segmentBase;
+			}
+
+			static uint32_t compressPointer(SkipListNode* node) {
+				if constexpr (sizeof(uintptr_t) == 8) {
+					return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(node) >> 4);
+				}
+				else {
+					return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(node));
+				}
+			}
+
+			static SkipListNode* decompressPointer(uint32_t compressedPtr) {
+				if constexpr (sizeof(uintptr_t) == 8) {
+					return reinterpret_cast<SkipListNode*>(SkipListNode::segmentBase | (static_cast<uintptr_t>(compressedPtr) << 4));
+				}
+				else {
+					return reinterpret_cast<SkipListNode*>(static_cast<uintptr_t>(compressedPtr));
+				}
+			}
+
 			static SkipListNode* create(const index_t baseIndex, const uint8_t level, const bool withElements = true) {
-				const uint8_t capacity = bits::ceil<uint8_t>(level + 1);
+				const uint8_t capacity = bits_ceil(level + 1);
 
 				//the node is fixed size, allocated once and never moves
-				SkipListNode* node = new SkipListNode();
+				SkipListNode* node = SkipListNode::acquire_node();
 
-				//T is the element type, counts are object counts: 2 pointers per level
-				node->nodes = bbsl::reallocObject<SkipListNode*>(nullptr, 0, capacity << 1);
-
-				node->elements = nullptr;
-				if (withElements) {
-					//the buffer is allocated once and never moves, so any default constructible
-					//and copy assignable type works, triviality is not required anymore
-					node->elements = new value_t[bbsl::capacity_count];
+				//T is the element type, counts are object counts: 2 pointers per level, upto 64 * 4B = 256B
+				node->nodes = static_cast<uint32_t*>(arenaSlab_alloc(&arenaSlabDefault, sizeof(uint32_t) * (capacity << 1)));
+				if (node->nodes == nullptr) {
+					std::cerr << "Memory allocation failed!\n";
+					exit(1);
 				}
+
+				//the buffer is allocated once and never moves, so any default constructible
+				//and copy assignable type works, triviality is not required anymore
+				node->elements = withElements ? new value_t[bbsl::capacity_count] : nullptr;
 
 				node->baseIndex = baseIndex;
 				node->bitMap = 0;
 				node->node_capacity = capacity;
 				node->level = level;
-				std::fill_n(node->nodes, capacity << 1, nullptr);
+				std::fill_n(node->nodes, capacity << 1, compressed_nullptr);
 				return node;
 			}
 
 			static void destroy(SkipListNode* node) {
 				delete[] node->elements;
-				bbsl::reallocObject<SkipListNode*>(node->nodes, node->node_capacity << 1, 0);
-				delete node;
+				arenaSlab_free(&arenaSlabDefault, node->nodes);
+				SkipListNode::restore_node(node);
 			}
 
 			/**
 			 * @brief	raises the level by one, reallocating the pointer array when capacity runs out.
 			 *			the node itself never moves, so neighbor pointers stay valid.
-			 * @param	node
 			 */
-			static void grow(SkipListNode* node) {
-				++node->level;
-				if (node->level < node->node_capacity) {
-					node->nodes[node->level << 1] = nullptr;
-					node->nodes[(node->level << 1) | 1] = nullptr;
+			void grow() {
+				++this->level;
+				if (this->level < this->node_capacity) {
+					this->nodes[this->level << 1] = compressed_nullptr;
+					this->nodes[(this->level << 1) | 1] = compressed_nullptr;
 					return;
 				}
 
-				const uint8_t newCapacity = node->node_capacity << 1;
-				node->nodes = bbsl::reallocObject<SkipListNode*>(node->nodes, node->node_capacity << 1, newCapacity << 1);
-				node->node_capacity = newCapacity;
-				std::fill_n(node->nodes + (node->level << 1), (newCapacity - node->level) << 1, nullptr);
+				const uint8_t newCapacity = this->node_capacity << 1;
+				this->nodes = static_cast<uint32_t*>(arenaSlab_realloc(&arenaSlabDefault, this->nodes, sizeof(uint32_t) * (newCapacity << 1)));
+				if (this->nodes == nullptr) {
+					std::cerr << "Memory allocation failed!\n";
+					exit(1);
+				}
+				this->node_capacity = newCapacity;
+				std::fill_n(this->nodes + (this->level << 1), (newCapacity - this->level) << 1, compressed_nullptr);
 			}
 
 			/**
@@ -174,7 +195,7 @@ namespace bbsl {
 			 * @return
 			 */
 			bool hasElement(const uint8_t index) {
-				return (index < bbsl::capacity_count) && bits::get(this->bitMap, index);
+				return (index < bbsl::capacity_count) && bits_get(this->bitMap, index);
 			}
 
 			/**
@@ -185,7 +206,7 @@ namespace bbsl {
 			void getElement(const uint8_t index, value_t& value) const {
 				//if (index >= bbsl::capacity_count) return;
 				//set value
-				if (bits::get(this->bitMap, index)) value = this->elements[index];
+				if (bits_get(this->bitMap, index)) value = this->elements[index];
 			}
 
 			/**
@@ -197,7 +218,7 @@ namespace bbsl {
 
 				//set value and bitmap
 				this->elements[index] = value;
-				bits::set_one(this->bitMap, index);
+				bits_set_one(this->bitMap, index);
 			}
 
 			/**
@@ -206,7 +227,7 @@ namespace bbsl {
 			 */
 			void deleteElement(const uint8_t index) {
 				//if (index >= bbsl::capacity_count) return;
-				bits::set_zero(this->bitMap, index);
+				bits_set_zero(this->bitMap, index);
 			}
 
 			void decreaseLevel() {
@@ -214,19 +235,19 @@ namespace bbsl {
 			}
 
 			SkipListNode* getLeftNode(const uint8_t level) const {
-				return this->nodes[(level << 1) | 1];
+				return SkipListNode::decompressPointer(this->nodes[(level << 1) | 1]);
 			}
 
 			SkipListNode* getRightNode(const uint8_t level) const {
-				return this->nodes[(level << 1)];
+				return SkipListNode::decompressPointer(this->nodes[(level << 1)]);
 			}
 
 			void setLeftNode(const uint8_t level, SkipListNode* node) {
-				this->nodes[(level << 1) | 1] = node;
+				this->nodes[(level << 1) | 1] = SkipListNode::compressPointer(node);
 			}
 
 			void setRightNode(const uint8_t level, SkipListNode* node) {
-				this->nodes[(level << 1)] = node;
+				this->nodes[(level << 1)] = SkipListNode::compressPointer(node);
 			}
 
 			static bool isIndexValid(const uint64_t index) {
@@ -235,12 +256,12 @@ namespace bbsl {
 
 			static int8_t begin(const SkipListNode* node) {
 				if (node->bitMap == 0) return -1;
-				return bits::ctz64(node->bitMap);
+				return bits_ctz64(node->bitMap);
 			}
 
 			static int8_t end(const SkipListNode* node) {
 				if (node->bitMap == 0) return -1;
-				uint8_t clzValue = bits::clz64(node->bitMap) - (64 - bbsl::capacity_count);
+				uint8_t clzValue = bits_clz64(node->bitMap) - (64 - bbsl::capacity_count);
 				return bbsl::capacity_count - clzValue - 1;
 			}
 
@@ -249,24 +270,27 @@ namespace bbsl {
 				// 0b00101100, index = 2, nextBits = 0b00001011, nextIndex = 3
 				bitMap_t nextBits = node->bitMap >> (index + 1);
 				if (nextBits == 0) return -1; // ctz will return 64 if the input is 0, so we must directly return -1
-				return index + bits::ctz64(nextBits) + 1;
+				return index + bits_ctz64(nextBits) + 1;
 			}
 
 			static int8_t prev(const SkipListNode* node, const int8_t index) {
 				if (index >= bbsl::capacity_count || index == 0) return -1;
 				// 0b00101100, index = 5, prevBits = 0b01100000, prevIndex = 3
-				bitMap_t prevBits = node->bitMap << (bbsl::capacity_count - index);
-				if (prevBits == 0) return -1;// clz will return 64 if the input is 0, so we must directly return -1
-				uint8_t clzValue = bits::clz64(node->bitMap) - (64 - bbsl::capacity_count);
-				return index - clzValue - 1;
+				// prevBits = the set bits below index, shifted to the top of the window;
+				// prev is the highest of them mapped back: (63 - clz64(prevBits)) - (8 - index)
+				bitMap_t prevBits = static_cast<bitMap_t>(node->bitMap << (bbsl::capacity_count - index));
+				if (prevBits == 0) return -1; // clz will return 64 if the input is 0, so we must directly return -1
+				return static_cast<int8_t>((63 - bits_clz64(prevBits)) - (bbsl::capacity_count - index));
 			}
 		};
 
+		// limit node size
+		static_assert(sizeof(SkipListNode) <= 32, "Node size exceeds limit");
 	protected:
 		mutable SkipListNode* leftPathNodes[32] = { nullptr };
 		bbsl::Xoroshiro64StarStar rng;
 
-		//heap allocated with pre-sized capacity (level 31), so their pointer arrays never realloc
+		//heap allocated, start at level 0 and grow via grow() alongside the list height
 		SkipListNode* sentryHead;
 		SkipListNode* sentryTail;
 
@@ -277,9 +301,9 @@ namespace bbsl {
 
 		//check if need add level
 		void increaseLevel() {
-			// 1. level up sentry
-			++this->sentryHead->level;
-			++this->sentryTail->level;
+			// 1. level up sentry, grow() never moves them, only their pointer arrays may realloc
+			this->sentryHead->grow();
+			this->sentryTail->grow();
 			++this->level;
 
 			// 2. get nodes witch level == this->level - 1
@@ -297,7 +321,7 @@ namespace bbsl {
 				// 50% percent
 				if ((this->rng.next() & 1) || !promoted) {
 					// grow() never moves the node, neighbors stay valid
-					SkipListNode::grow(node);
+					node->grow();
 
 					// connect node
 					node->setLeftNode(this->level, left);
@@ -319,7 +343,8 @@ namespace bbsl {
 			//level down all node that level == this.level
 			SkipListNode* node = this->sentryHead;
 
-			while (node != nullptr) {
+			//the tail's right slot is a null slot: decompressed it reads segmentNull, so terminate via isNonNull
+			while (SkipListNode::isNonNull(node)) {
 				SkipListNode* right = node->getRightNode(this->level);
 				node->decreaseLevel();
 				node = right;
@@ -334,7 +359,7 @@ namespace bbsl {
 		 */
 		uint8_t getRandomLevel() {
 			//limit level [0-31]
-			const auto count = bits::ctz64(this->rng.next()) & 31;
+			const auto count = bits_ctz64(this->rng.next()) & 31;
 			return (count <= this->level) ? count : this->level;
 		}
 
@@ -460,11 +485,9 @@ namespace bbsl {
 		BitmappedBlockSkipList(const value_t& invalid) {
 			this->invalid = invalid;
 
-			//pre-size the sentries for the maximum level so their pointer arrays never realloc
-			this->sentryHead = SkipListNode::create(0, 31, false);
-			this->sentryTail = SkipListNode::create(0, 31, false);
-			this->sentryHead->level = 0;
-			this->sentryTail->level = 0;
+			//sentries start small, their pointer arrays grow alongside the list height
+			this->sentryHead = SkipListNode::create(0, 0, false);
+			this->sentryTail = SkipListNode::create(0, 0, false);
 
 			this->sentryHead->setRightNode(0, this->sentryTail);
 			this->sentryTail->setLeftNode(0, this->sentryHead);
@@ -478,10 +501,9 @@ namespace bbsl {
 		BitmappedBlockSkipList(const value_t& invalid, uint64_t seed) {
 			this->invalid = invalid;
 
-			this->sentryHead = SkipListNode::create(0, 31, false);
-			this->sentryTail = SkipListNode::create(0, 31, false);
-			this->sentryHead->level = 0;
-			this->sentryTail->level = 0;
+			//sentries start small, their pointer arrays grow alongside the list height
+			this->sentryHead = SkipListNode::create(0, 0, false);
+			this->sentryTail = SkipListNode::create(0, 0, false);
 
 			this->sentryHead->setRightNode(0, this->sentryTail);
 			this->sentryTail->setLeftNode(0, this->sentryHead);
@@ -492,7 +514,7 @@ namespace bbsl {
 		~BitmappedBlockSkipList() {
 			// release one by one
 			SkipListNode* node = this->sentryHead->getRightNode(0);
-			while (node != nullptr && node != this->sentryTail) {
+			while (SkipListNode::isNonNull(node) && node != this->sentryTail) {
 				SkipListNode* next = node->getRightNode(0);
 				SkipListNode::destroy(node);
 				node = next;
@@ -615,7 +637,7 @@ namespace bbsl {
 		template<typename Func>
 		void forEach(Func func) const {
 			SkipListNode* node = this->sentryHead->getRightNode(0);
-			while (node != nullptr && node != this->sentryTail) {
+			while (SkipListNode::isNonNull(node) && node != this->sentryTail) {
 				// dense fast path: every slot is occupied, iterate sequentially without bit tests
 				if (node->bitMap == std::numeric_limits<bitMap_t>::max()) {
 					const index_t base = node->baseIndex;
@@ -636,7 +658,7 @@ namespace bbsl {
 		template<typename Func>
 		bool some(Func func) const {
 			SkipListNode* node = this->sentryHead->getRightNode(0);
-			while (node != nullptr && node != this->sentryTail) {
+			while (SkipListNode::isNonNull(node) && node != this->sentryTail) {
 				// dense fast path: every slot is occupied, iterate sequentially without bit tests
 				if (node->bitMap == std::numeric_limits<bitMap_t>::max()) {
 					const index_t base = node->baseIndex;
@@ -658,7 +680,7 @@ namespace bbsl {
 		template<typename Func>
 		bool every(Func func) const {
 			SkipListNode* node = this->sentryHead->getRightNode(0);
-			while (node != nullptr && node != this->sentryTail) {
+			while (SkipListNode::isNonNull(node) && node != this->sentryTail) {
 				// dense fast path: every slot is occupied, iterate sequentially without bit tests
 				if (node->bitMap == std::numeric_limits<bitMap_t>::max()) {
 					const index_t base = node->baseIndex;
@@ -712,7 +734,7 @@ namespace bbsl {
 
 				if (nextIndex == -1) {
 					this->node = this->node->getRightNode(0);
-					if (this->node != nullptr && this->node != this->skiplist->sentryTail) {
+					if (SkipListNode::isNonNull(this->node) && this->node != this->skiplist->sentryTail) {
 						this->inside_index = SkipListNode::begin(this->node);
 					}
 					else {
@@ -732,7 +754,7 @@ namespace bbsl {
 				int8_t prevIndex = SkipListNode::prev(this->node, this->inside_index);
 				if (prevIndex == -1) {
 					this->node = this->node->getLeftNode(0);
-					if (this->node != nullptr && this->node != this->skiplist->sentryHead) {
+					if (SkipListNode::isNonNull(this->node) && this->node != this->skiplist->sentryHead) {
 						this->inside_index = SkipListNode::end(this->node);
 					}
 					else {
@@ -806,13 +828,13 @@ namespace bbsl {
 				// first set bit at or after offset inside this block
 				const bitMap_t candidateBits = node->bitMap & static_cast<bitMap_t>(~((1u << offset) - 1));
 				if (candidateBits != 0) {
-					return IterObject(this, node, static_cast<int8_t>(bits::ctz64(candidateBits)));
+					return IterObject(this, node, static_cast<int8_t>(bits_ctz64(candidateBits)));
 				}
 			}
 
 			// nothing at/after index inside the node, the chain is key sorted: next block's begin
 			SkipListNode* next = node->getRightNode(0);
-			if (next == this->sentryTail || next == nullptr) return IterObject(this, nullptr, 0);
+			if (next == this->sentryTail || !SkipListNode::isNonNull(next)) return IterObject(this, nullptr, 0);
 			return IterObject(this, next, SkipListNode::begin(next));
 		}
 
@@ -825,5 +847,41 @@ namespace bbsl {
 			if (index == std::numeric_limits<index_t>::max()) return IterObject(this, nullptr, 0);
 			return this->lowerBound(index + 1);
 		}
+
+#ifdef BBSL_MEMORY_STATS
+		/**
+		 * @brief	traversal-based memory accounting: walks the level-0 chain and sums the
+		 *			requested bytes of every node header, pointer array and element buffer
+		 *			(sentries included; slab class rounding counts as allocator overhead, not here).
+		 *			compiled only when BBSL_MEMORY_STATS is defined before including this header.
+		 */
+		struct MemoryUsage {
+			size_t bytes;
+			uint64_t allocations;
+		};
+
+		MemoryUsage memoryUsage() const {
+			const auto arrayBytes = [](const SkipListNode* node) {
+				return sizeof(uint32_t) * (static_cast<size_t>(node->node_capacity) << 1);
+			};
+
+			MemoryUsage usage{ 0, 0 };
+			SkipListNode* node = this->sentryHead;
+			while (SkipListNode::isNonNull(node) && node != this->sentryTail) {
+				usage.bytes += sizeof(SkipListNode) + arrayBytes(node);
+				usage.allocations += 2; // node header + pointer array
+				if (node->elements != nullptr) {
+					usage.bytes += sizeof(value_t) * bbsl::capacity_count;
+					++usage.allocations;
+				}
+				node = node->getRightNode(0);
+			}
+
+			// the tail sentinel
+			usage.bytes += sizeof(SkipListNode) + arrayBytes(this->sentryTail);
+			usage.allocations += 2;
+			return usage;
+		}
+#endif
 	};
 }

@@ -20,10 +20,15 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="test.cpp" />
+    <ClCompile Include="third-party\slabAllocator\includes\arena_slab.c" />
+    <ClCompile Include="third-party\slabAllocator\includes\bits.c" />
+    <ClCompile Include="third-party\slabAllocator\includes\palloc_os.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\bits.hpp" />
     <ClInclude Include="src\bbsl.hpp" />
+    <ClInclude Include="third-party\slabAllocator\includes\arena_slab.h" />
+    <ClInclude Include="third-party\slabAllocator\includes\bits.h" />
+    <ClInclude Include="third-party\slabAllocator\includes\palloc_os.h" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
@@ -105,6 +110,7 @@
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -141,6 +147,7 @@
       <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
       <LanguageStandard_C>stdclatest</LanguageStandard_C>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>

@@ -5,10 +5,10 @@
 */
 #include <cstddef>
 
-// exact requested-byte accounting for bbsl node pointer arrays: declared here, defined in the
-// memcount namespace below; the macro bakes the call into reallocObject with no branch
-namespace memcount { void accountBlock(size_t oldBytes, size_t newBytes); }
-#define BBSL_REALLOC_HOOK(ob, nb) memcount::accountBlock((ob), (nb))
+// bbsl now allocates through its own arena slab, invisible to the operator-new seam, so it
+// reports its own exact usage via a traversal-based memoryUsage(); compiled in by defining
+// BBSL_MEMORY_STATS before the header
+#define BBSL_MEMORY_STATS
 #include "./src/bbsl.hpp"
 #include <cmath>
 #include <iostream>
@@ -825,8 +825,8 @@ void test_hashmap_traversal_performance() {
 
 // ============= Memory Footprint Tests =============
 
-// exact requested-byte accounting at the allocation seam: every operator new/delete
-// and every bbsl node block is recorded while a measurement window is open, so the
+    // exact requested-byte accounting for the allocation seam: every operator new/delete
+    // is recorded while a measurement window is open, so the
 // reported numbers exclude allocator bucket rounding and per-allocation overhead
 // entirely (and transfer to any future custom allocator)
 namespace memcount {
@@ -881,15 +881,6 @@ namespace memcount {
         Scope() { liveBytes = 0; allocCount = 0; enabled = true; }
         ~Scope() { enabled = false; }
     };
-
-    // bbsl node pointer arrays bypass operator new (realloc seam), so their byte deltas
-    // arrive through bbsl::reallocObject's hook with explicit old/new sizes instead of the registry
-    void accountBlock(size_t oldBytes, size_t newBytes) {
-        if (!enabled) return;
-        if (oldBytes == 0 && newBytes > 0) ++allocCount;
-        liveBytes = static_cast<size_t>(static_cast<int64_t>(liveBytes)
-            + static_cast<int64_t>(newBytes) - static_cast<int64_t>(oldBytes));
-    }
 }
 
 void* operator new(const size_t size) {
@@ -934,11 +925,25 @@ void measureMemory(const char* name, uint64_t elementCount, Make&& make, Fill&& 
         << allocs << " allocations" << std::endl;
 }
 
+// measures a container that reports its own exact usage (e.g. bbsl::memoryUsage traversal)
+template<typename T, typename Make, typename Fill, typename Stats>
+void measureMemoryWith(const char* name, uint64_t elementCount, Make&& make, Fill&& fill, Stats&& stats) {
+    std::unique_ptr<T> c = make();
+    fill(*c);
+    const auto usage = stats(*c);
+
+    const double mb = static_cast<double>(usage.bytes) / (1024.0 * 1024.0);
+    const double bpe = elementCount ? static_cast<double>(usage.bytes) / static_cast<double>(elementCount) : 0.0;
+    std::cout << "  [" << name << "] " << mb << " MB, " << bpe << " B/elem, "
+        << usage.allocations << " allocations" << std::endl;
+}
+
 void test_memory_footprint() {
     const uint64_t N = testCount;
 
     std::cout << "\n========== Memory Footprint Tests ==========\n";
-    std::cout << "(exact requested bytes at the allocation seam, allocator overhead excluded)\n";
+    std::cout << "(exact requested bytes: allocation seam for std containers, traversal accounting\n";
+    std::cout << " for bbsl; allocator overhead excluded)\n";
 
     // fixed per-instance cost, no heap internals exist while empty
     std::cout << "\n[Empty instance sizeof] (fixed cost per instance)\n";
@@ -965,11 +970,12 @@ void test_memory_footprint() {
         [](std::unordered_map<uint64_t, int>& m) {
             for (uint64_t i = 0; i < testCount; ++i) m[i] = static_cast<int>(i);
         });
-    measureMemory<BitmappedBlockSkipList<uint64_t, int>>("bbsl", N,
+    measureMemoryWith<BitmappedBlockSkipList<uint64_t, int>>("bbsl", N,
         [] { return std::make_unique<BitmappedBlockSkipList<uint64_t, int>>(-1); },
         [](BitmappedBlockSkipList<uint64_t, int>& c) {
             for (uint64_t i = 0; i < testCount; ++i) c[i] = static_cast<int>(i);
-        });
+        },
+        [](BitmappedBlockSkipList<uint64_t, int>& c) { return c.memoryUsage(); });
 
     // ---- sparse family: elementCount keys, stride `step`, so blocks get thinner as step grows ----
     auto sparseCase = [&](const char* title, uint64_t elementCount, uint64_t step) {
@@ -984,11 +990,12 @@ void test_memory_footprint() {
             [&](std::unordered_map<uint64_t, int>& m) {
                 for (uint64_t i = 0; i < elementCount; ++i) m[i * step] = static_cast<int>(i);
             });
-        measureMemory<BitmappedBlockSkipList<uint64_t, int>>("bbsl", elementCount,
+        measureMemoryWith<BitmappedBlockSkipList<uint64_t, int>>("bbsl", elementCount,
             [] { return std::make_unique<BitmappedBlockSkipList<uint64_t, int>>(-1); },
             [&](BitmappedBlockSkipList<uint64_t, int>& c) {
                 for (uint64_t i = 0; i < elementCount; ++i) c[i * step] = static_cast<int>(i);
-            });
+            },
+            [](BitmappedBlockSkipList<uint64_t, int>& c) { return c.memoryUsage(); });
     };
 
     sparseCase("Sparse 10%", N / 10, 10);
