@@ -455,8 +455,8 @@ namespace bbsl {
 			SkipListNode* left = nullptr, * right = nullptr;
 
 			for (auto i = 0; i <= node->level; ++i) {
-				// must call findLeftNode before removeNode, so leftPathNodes are valid
-				left = (this->leftPathNodes[i] != node) ? this->leftPathNodes[i] : node->getLeftNode(i);
+				// the node's own back pointers are always its exact level-i left neighbors
+				left = node->getLeftNode(i);
 				right = node->getRightNode(i);
 
 				left->setRightNode(i, right);
@@ -470,10 +470,27 @@ namespace bbsl {
 			this->leftPathNodes[0] = nullptr;
 
 			constexpr auto minLevel = 6;
-			if (this->level < minLevel) return;
-
-			if (this->width < (1ULL << (this->level - 1))) {
+			if (this->level >= minLevel && this->width < (1ULL << (this->level - 1))) {
 				this->decreaseLevel();
+			}
+
+			// heal-on-erase: the top chain must never stay empty, otherwise searches
+			// degrade to O(2^k + k) on the thinned tower until a fresh tall insert arrives
+			while (this->level > 0 && this->sentryHead->getRightNode(this->level) == this->sentryTail) {
+				SkipListNode* candidate = this->sentryHead->getRightNode(this->level - 1);
+				if (candidate == this->sentryTail) {
+					// the tower below is gone too: drop the level to match reality and retry
+					this->decreaseLevel();
+				}
+				else {
+					// force-promote the first level-(level-1) node, top chain gets a member back
+					candidate->grow();
+					this->sentryHead->setRightNode(this->level, candidate);
+					candidate->setLeftNode(this->level, this->sentryHead);
+					candidate->setRightNode(this->level, this->sentryTail);
+					this->sentryTail->setLeftNode(this->level, candidate);
+					break;
+				}
 			}
 		}
 	public:
@@ -558,8 +575,7 @@ namespace bbsl {
 
 					//remove node
 					if (node->isEmpty()) {
-						// unlinking needs the descent path, rebuild it here
-						this->findLeftNode(index);
+						// removeNode unlinks via the node's own back pointers, no descent path needed
 						this->removeNode(node);
 					}
 					return true;
